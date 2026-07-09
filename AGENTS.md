@@ -79,7 +79,7 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 
 ## 待办（vllm-ascend 残留清理）
 
-> 本仓库 git 历史从 vllm-ascend fork 而来，`main` 上还残留大量 vllm-ascend 文件（`vllm_ascend/`、`csrc/`、`docs/`、`tests/`、`benchmarks/`、`examples/`、`tools/`、`.github/`、`Dockerfile*`、`setup.py`、`pyproject.toml`、`requirements*.txt`、`format.sh`、`mypy.ini`、`codecov.yml`、`CMakeLists.txt`、`cmake/`、`DCO`、`LICENSE`、`CODE_OF_CONDUCT.md`、`CONTRIBUTING.md`、`README.md`、`README.zh.md`、`collect_env.py`、`packages.txt`、`.pre-commit-config.yaml`、`.readthedocs.yaml`、`typos.toml`、`.gemini/`）。这些与 Neutron (Rust) 无关，应在新分支上 `git rm` 清理，保留 `LICENSE`（Apache-2.0 通用）。
+> 本仓库 git 历史从 vllm-ascend fork 而来。**已于 2026-07-09（feat/cleanup-and-basic-passes 分支）清理完 vllm-ascend 残留 460 文件**（`vllm_ascend/`、`csrc/`、`docs/`、`tests/`、`benchmarks/`、`examples/`、`tools/`、`.github/`、`Dockerfile*`、`setup.py`、`pyproject.toml`、`requirements*.txt`、`format.sh`、`mypy.ini`、`codecov.yml`、`CMakeLists.txt`、`cmake/`、`DCO`、`CODE_OF_CONDUCT.md`、`CONTRIBUTING.md`、`README.md`、`README.zh.md`、`collect_env.py`、`packages.txt`、`.pre-commit-config.yaml`、`.readthedocs.yaml`、`typos.toml`、`.gemini/`），仅保留 `LICENSE`（Apache-2.0）。此条已结案。
 
 ## Continuity Log（进度遗言）
 
@@ -119,3 +119,29 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
    - fuse：实现多对一启发式融合（带 cost model 判定收益）
 4. frontend：实现真正的 ONNX 解析（当前空输入返回 Placeholder）
 5. isel：用 lisp 解释器驱动 isel 规则匹配
+
+### 2026-07-09 — 残留清理 + 基础 pass 充实（feat/cleanup-and-basic-passes）
+
+**当前状态**：vllm-ascend 残留已清空，4 个基础优化 pass（algebra/cse/float_opts/fuse）从空壳补全为可用实现，回归全绿。本分支待合并回 dev → main。
+
+**已完成**：
+- 清理 vllm-ascend 残留 460 文件，仅留 LICENSE，重写 README.md（Neutron 版）— commit 9c42f28
+- algebra 补全：常量折叠 + x+0/x*1/x*0=0/x/1=x + 可选 x-x=0/x/x=1（unsafe 开关）。两阶段模式（先收集建议再应用）解决 borrow 冲突；不动点迭代 + processed HashSet 防死循环。6 单测 — commit a387a38
+- CSE 升级指纹：`Fingerprint` enum（Op(op, normalized_inputs) / Constant(f64::to_bits)），可交换 op (Add/Mul) inputs 排序后比较。4 单测 — commit 7d6d364
+- float_opts 实现：DivByConstToMul（x/c→x*(1/c) 改 op_tag+换常量）、MulByTwoToAdd（x*2→x+x）、FastInvSqrt/SoftmaxOnline 仅识别不改图（留给 lowering）。base 加 Sqrt(20)/Exp(21)/Pow(22) op。5 单测 — commit fb2f81d
+- fuse 实现：elementwise 链（Add/Sub/Mul/Div/Relu/Gelu/Sigmoid/Tanh/Sqrt/Exp）尾节点改 Custom，inputs 重写为链头 inputs，attr 记 op 序列，其余节点 compact 删除。cost_model 判定融合收益 > 0 才融。3 单测
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：27 passed (common 2 + interface 1 + lisp 4 + optimizer 20)
+
+**设计哲学遵守**：本轮严格按"不做固定模式匹配，先把基础优化做扎实"的约束。algebra 只用简单代数规则；CSE 是 IO 同样性识别；float_opts 针对浮点本身结构；fuse 是 elementwise 链通用融合（非 MatMul+Add→Linear 这类贪心模式）。decompose（LayerNorm/Softmax/Gelu 一对多拆细）刻意推迟到后续轮，先把基础打牢。
+
+**下一步**（优先级排序）：
+1. 合并 feat/cleanup-and-basic-passes → dev → main（按"没崩就合并"策略）
+2. decompose 从经典到难：LayerNorm → Softmax → Gelu（每轮一个，单测驱动）
+3. frontend：实现真正的 ONNX 解析，构造带算子的测试 ONNX
+4. isel：用 lisp 解释器驱动 isel 规则匹配
+5. algebra 可继续扩展：常量传播、shape 推断后基于 shape 的简化
