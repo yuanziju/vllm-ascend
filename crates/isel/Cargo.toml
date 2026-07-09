@@ -1,0 +1,13 @@
+[package]
+name = "isel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+base = { workspace = true }
+arch = { workspace = true }
+lisp = { workspace = true }
+common = { workspace = true }

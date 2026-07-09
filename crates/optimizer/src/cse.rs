@@ -1,6 +1,6 @@
 //! cse — 公共子表达式消除（IO 同样性）
 
-use base::{Graph, NodeView, OpKind, Result, ValueId};
+use base::{Graph, OpKind, Result, ValueId};
 use std::collections::HashMap;
 
 pub struct CseResult {

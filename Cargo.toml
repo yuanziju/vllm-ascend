@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/base",
+    "crates/common",
+    "crates/frontend",
+    "crates/optimizer",
+    "crates/arch",
+    "crates/lisp",
+    "crates/isel",
+    "crates/interface",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+authors = ["Neutron contributors"]
+
+[workspace.dependencies]
+base = { path = "crates/base" }
+common = { path = "crates/common" }
+frontend = { path = "crates/frontend" }
+optimizer = { path = "crates/optimizer" }
+arch = { path = "crates/arch" }
+lisp = { path = "crates/lisp" }
+isel = { path = "crates/isel" }
+interface = { path = "crates/interface" }
+thiserror = "1"
+tracing = "0.1"

@@ -4,8 +4,9 @@ use base::Graph;
 use std::cell::Cell;
 
 /// 优化的目标后端
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Target {
+    #[default]
     Cuda,
     Npu,
     Cpu,

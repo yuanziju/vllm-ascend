@@ -9,7 +9,7 @@ pub use interp::Interp;
 pub use parser::parse;
 
 /// S-expr 值
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Val {
     Nil,
     Bool(bool),

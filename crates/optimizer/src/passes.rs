@@ -1,6 +1,6 @@
 //! passes — 基础 pass（DCE/Verify）
 
-use base::{Graph, NeutronError, OpKind, Pass, PassContext, Result};
+use base::{Graph, NeutronError, Pass, PassContext, Result};
 use std::collections::HashSet;
 
 /// 死代码消除：从 outputs 反向 BFS，删除不可达节点，物理重建图

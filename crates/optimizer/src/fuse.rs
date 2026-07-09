@@ -1,6 +1,6 @@
 //! fuse — 多对一启发式融合（基于 cost model）
 
-use base::{Graph, NodeView, OpKind, Result, ValueId};
+use base::{Graph, OpKind, Result, ValueId};
 use crate::cost_model::{fusion_saving, CostCoeffs};
 
 pub struct FusionOpportunity {
