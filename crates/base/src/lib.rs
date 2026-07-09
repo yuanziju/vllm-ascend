@@ -168,6 +168,12 @@ pub enum OpKind {
     Sqrt = 20,
     Exp = 21,
     Pow = 22,
+    /// ReduceSum：沿指定轴求和（attr Axis 记录轴）。decompose Softmax/LayerNorm 拆细需要
+    ReduceSum = 23,
+    /// ReduceMean：沿指定轴求均值（attr Axis 记录轴）。decompose LayerNorm 拆细需要
+    ReduceMean = 24,
+    /// ReduceMax：沿指定轴取最大值（attr Axis 记录轴）。decompose Softmax 数值稳定需要
+    ReduceMax = 25,
     Custom = 64,
 }
 
@@ -197,6 +203,9 @@ impl OpKind {
             20 => Ok(Self::Sqrt),
             21 => Ok(Self::Exp),
             22 => Ok(Self::Pow),
+            23 => Ok(Self::ReduceSum),
+            24 => Ok(Self::ReduceMean),
+            25 => Ok(Self::ReduceMax),
             64 => Ok(Self::Custom),
             _ => Err(NeutronError::Ir(format!("未知 op tag: {}", v))),
         }

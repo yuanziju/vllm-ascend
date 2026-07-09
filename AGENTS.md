@@ -145,3 +145,35 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 3. frontend：实现真正的 ONNX 解析，构造带算子的测试 ONNX
 4. isel：用 lisp 解释器驱动 isel 规则匹配
 5. algebra 可继续扩展：常量传播、shape 推断后基于 shape 的简化
+
+### 2026-07-09 — decompose 三件套实现（feat/neutron-c3d30820）
+
+**当前状态**：decompose 三个复合算子（LayerNorm/Softmax/Gelu）全部从空壳补全为数学等价的细粒度拆分，回归全绿。本分支待合并回 main。
+
+**分支策略调整**：按用户要求改为"公共前缀+哈希"命名（`feat/neutron-<8hex>`），能复用就复用，不建一堆分支。
+
+**已完成**：
+- base 补 IR op：ReduceSum(23)/ReduceMean(24)/ReduceMax(25) + from_u8 映射。decompose 拆细需要 Reduce 类原语
+- decompose LayerNorm：LN(x,γ,β,ε) → mean=ReduceMean(x) → xc=Sub(x,mean) → var=ReduceMean(xc*xc) → std=Sqrt(var+ε) → inv=Div(1,std) → norm=Mul(xc,inv) → scaled=Mul(norm,γ) → out=Add(scaled,β)。10 个原语节点
+- decompose Softmax（数值稳定版）：m=ReduceMax(x) → shifted=Sub(x,m) → e=Exp(shifted) → s=ReduceSum(e) → out=Div(e,s)。5 个原语节点。用 max 技巧避免 Exp 溢出
+- decompose Gelu（tanh 近似）：x³=x*x*x → kx3=Mul(x3,0.044715) → t=Add(x,kx3) → ct=Mul(t,sqrt(2/π)) → th=Tanh(ct) → 1+th → 0.5*x → out=Mul(0.5x, 1+th)。9 个原语节点
+- 通用辅助：build_reduce/build_binop/build_unop 构造子图；read_axis/read_epsilon 读属性；rewrite_value_uses 重写原节点输出的所有使用者；compact 物理删除原节点
+- cost_model 补 ReduceSum/ReduceMean/ReduceMax 估算（flops = in_bytes/4*2）
+- lowering 补全原语 op 映射（Sub/Mul/Div/Sqrt/Exp/Pow/Reduce*/Constant 等），确保 decompose 后图能 lower
+- 5 单测：layernorm_decomposes_to_subgraph / softmax_decomposes_numerically_stable / gelu_decomposes_to_tanh_approx / output_rewired_to_new_subgraph / non_decomposable_nodes_untouched
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：32 passed (common 2 + interface 1 + lisp 4 + optimizer 25)
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
+
+**设计哲学遵守**：decompose 是"一对多拆细"（合法），把复合算子拆成基础原语让后续 algebra/CSE/fuse 在细粒度上做通用优化，不是贪心模式匹配。Gelu 用 tanh 近似避免 erf（erf 后端不一定有原生 kernel）。Softmax 用数值稳定 max 技巧。
+
+**下一步**（优先级排序）：
+1. 合并 feat/neutron-c3d30820 → main
+2. frontend：实现真正的 ONNX 解析，构造带算子的测试 ONNX（让上层有真实输入喂给 decompose + 优化器）
+3. isel：用 lisp 解释器驱动 isel 规则匹配
+4. algebra 扩展：常量传播、shape 推断后基于 shape 的简化
+5. fuse 可扩展：reduce + elementwise 融合（目前只做 elementwise 链）
