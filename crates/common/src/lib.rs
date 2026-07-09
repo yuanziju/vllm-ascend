@@ -74,6 +74,9 @@ pub struct Config {
     pub opt_level: OptLevel,
     pub dump_ir: bool,
     pub trace_isel: bool,
+    /// 启用有 NaN/Inf 风险的代数规则（如 x-x=0、x/x=1）。
+    /// 默认 false（保守）。仅当确认无 NaN 时开启。
+    pub algebra_unsafe_opts: bool,
 }
 
 impl Default for Config {
@@ -83,6 +86,7 @@ impl Default for Config {
             opt_level: OptLevel::O2,
             dump_ir: false,
             trace_isel: false,
+            algebra_unsafe_opts: false,
         }
     }
 }

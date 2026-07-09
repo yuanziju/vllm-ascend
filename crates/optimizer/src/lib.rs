@@ -94,6 +94,7 @@ impl Pass for AlgebraPass {
         let count = algebra::run_algebraic_simplify(graph)?;
         if count > 0 {
             ctx.inc("algebra_simplified");
+            ctx.stats.insert("algebra_count".into(), count);
         }
         Ok(())
     }

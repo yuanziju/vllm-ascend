@@ -74,6 +74,8 @@ pub enum AttrKey {
     TransposeB = 8,
     Epsilon = 9,
     Shape = 10,
+    /// Constant 节点的标量值（Float tag），用于代数折叠/识别 0/1
+    Value = 11,
     Custom = 255,
 }
 
@@ -91,6 +93,7 @@ impl AttrKey {
             8 => Some(Self::TransposeB),
             9 => Some(Self::Epsilon),
             10 => Some(Self::Shape),
+            11 => Some(Self::Value),
             255 => Some(Self::Custom),
             _ => None,
         }

@@ -230,6 +230,19 @@ impl<'a> NodeView<'a> {
     pub fn attrs(&self) -> &'a [raw::AttrEntry] {
         self.raw.node_attrs(self.id)
     }
+
+    /// 若节点是 Constant 且带 AttrKey::Value (Float) 属性，返回其标量值。
+    pub fn constant_value(&self) -> Option<f64> {
+        if self.kind != OpKind::Constant {
+            return None;
+        }
+        for e in self.attrs() {
+            if e.key == AttrKey::Value as u8 && e.tag == raw::AttrTag::Float as u8 {
+                return Some(self.raw.attr_float(e));
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -336,6 +349,15 @@ impl Graph {
 
     pub fn add_input(&mut self, ty: Type, name: Option<&str>) -> ValueId {
         self.add_value(ty, name, u32::MAX)
+    }
+
+    /// 构造一个标量 Constant 节点：节点本身 + 输出 value + AttrKey::Value=float
+    pub fn add_constant_f64(&mut self, val: f64) -> (NodeId, ValueId) {
+        let node = self.raw.alloc_node(OpKind::Constant as u8);
+        let out = self.add_value(Type::Scalar(DType::F32), None, node);
+        self.raw.set_node_outputs(node, &[out]);
+        self.raw.add_attr_float(node, AttrKey::Value, val);
+        (node, out)
     }
 
     pub fn mark_output(&mut self, v: ValueId) {

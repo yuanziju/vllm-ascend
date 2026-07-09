@@ -92,6 +92,7 @@ mod tests {
             opt_level: OptLevel::O2,
             dump_ir: true,
             trace_isel: false,
+            algebra_unsafe_opts: false,
         };
         let out = compile(Input::Onnx(vec![]), cfg).unwrap();
         assert_eq!(out.target, "cuda");

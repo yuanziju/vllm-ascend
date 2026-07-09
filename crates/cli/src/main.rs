@@ -69,6 +69,7 @@ fn main() {
         opt_level,
         dump_ir,
         trace_isel: false,
+        algebra_unsafe_opts: false,
     };
 
     match interface::compile(interface::Input::Onnx(bytes), config) {
