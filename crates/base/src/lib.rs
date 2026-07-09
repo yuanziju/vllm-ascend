@@ -165,6 +165,9 @@ pub enum OpKind {
     Constant = 17,
     Placeholder = 18,
     Return = 19,
+    Sqrt = 20,
+    Exp = 21,
+    Pow = 22,
     Custom = 64,
 }
 
@@ -191,6 +194,9 @@ impl OpKind {
             17 => Ok(Self::Constant),
             18 => Ok(Self::Placeholder),
             19 => Ok(Self::Return),
+            20 => Ok(Self::Sqrt),
+            21 => Ok(Self::Exp),
+            22 => Ok(Self::Pow),
             64 => Ok(Self::Custom),
             _ => Err(NeutronError::Ir(format!("未知 op tag: {}", v))),
         }
