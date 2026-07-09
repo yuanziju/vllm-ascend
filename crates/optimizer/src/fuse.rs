@@ -1,7 +1,7 @@
 //! fuse — 多对一启发式融合（基于 cost model）
 
-use base::{Graph, OpKind, Result, ValueId};
 use crate::cost_model::{fusion_saving, CostCoeffs};
+use base::{Graph, OpKind, Result, ValueId};
 
 pub struct FusionOpportunity {
     pub nodes: Vec<base::NodeId>,
@@ -19,19 +19,32 @@ pub fn find_opportunities(graph: &Graph, coeffs: CostCoeffs) -> Result<Vec<Fusio
         if chain.len() >= 2 {
             let saving = fusion_saving(graph, &chain, coeffs)?;
             if saving > 0.0 {
-                opps.push(FusionOpportunity { nodes: chain, saving });
+                opps.push(FusionOpportunity {
+                    nodes: chain,
+                    saving,
+                });
             }
         }
     }
-    opps.sort_by(|a, b| b.saving.partial_cmp(&a.saving).unwrap_or(std::cmp::Ordering::Equal));
+    opps.sort_by(|a, b| {
+        b.saving
+            .partial_cmp(&a.saving)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(opps)
 }
 
 fn is_elementwise(kind: OpKind) -> bool {
     matches!(
         kind,
-        OpKind::Add | OpKind::Sub | OpKind::Mul | OpKind::Div
-            | OpKind::Relu | OpKind::Gelu | OpKind::Sigmoid | OpKind::Tanh
+        OpKind::Add
+            | OpKind::Sub
+            | OpKind::Mul
+            | OpKind::Div
+            | OpKind::Relu
+            | OpKind::Gelu
+            | OpKind::Sigmoid
+            | OpKind::Tanh
     )
 }
 
@@ -95,12 +108,18 @@ mod tests {
     fn finds_elementwise_chain() {
         let mut g = Graph::new("test");
         let x = g.add_input(
-            Type::Tensor { dtype: DType::F32, dims: vec![4] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
             Some("x"),
         );
         let relu = g.add_node(OpKind::Relu);
         let r_out = g.add_value(
-            Type::Tensor { dtype: DType::F32, dims: vec![4] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
             Some("r"),
             relu,
         );
@@ -108,7 +127,10 @@ mod tests {
         g.raw.set_node_outputs(relu, &[r_out]);
         let add = g.add_node(OpKind::Add);
         let a_out = g.add_value(
-            Type::Tensor { dtype: DType::F32, dims: vec![4] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
             Some("a"),
             add,
         );

@@ -11,13 +11,25 @@ pub struct CostCoeffs {
 
 impl CostCoeffs {
     pub fn cuda() -> Self {
-        Self { flops: 1.0, mem: 2.5, launch: 10.0 }
+        Self {
+            flops: 1.0,
+            mem: 2.5,
+            launch: 10.0,
+        }
     }
     pub fn npu() -> Self {
-        Self { flops: 0.8, mem: 2.0, launch: 5.0 }
+        Self {
+            flops: 0.8,
+            mem: 2.0,
+            launch: 5.0,
+        }
     }
     pub fn cpu() -> Self {
-        Self { flops: 1.0, mem: 1.0, launch: 0.0 }
+        Self {
+            flops: 1.0,
+            mem: 1.0,
+            launch: 0.0,
+        }
     }
     pub fn for_target(target: common::Target) -> Self {
         match target {
@@ -74,7 +86,11 @@ pub fn estimate_op(graph: &Graph, node: NodeView) -> Result<OpCost> {
         _ => (out_bytes / 4.0, 1.0),
     };
 
-    Ok(OpCost { flops, mem_bytes: mem, launch })
+    Ok(OpCost {
+        flops,
+        mem_bytes: mem,
+        launch,
+    })
 }
 
 fn value_bytes(v: base::ValueView) -> usize {
@@ -107,11 +123,7 @@ pub fn estimate_graph(graph: &Graph, coeffs: CostCoeffs) -> Result<f64> {
     Ok(total)
 }
 
-pub fn fusion_saving(
-    graph: &Graph,
-    nodes: &[base::NodeId],
-    coeffs: CostCoeffs,
-) -> Result<f64> {
+pub fn fusion_saving(graph: &Graph, nodes: &[base::NodeId], coeffs: CostCoeffs) -> Result<f64> {
     if nodes.len() < 2 {
         return Ok(0.0);
     }

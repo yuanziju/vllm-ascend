@@ -3,10 +3,20 @@
 use base::{Graph, NodeView, OpKind, Result};
 
 pub enum FloatOpt {
-    FastInvSqrt { sqrt_node: base::NodeId, div_node: base::NodeId },
-    SoftmaxOnline { softmax_node: base::NodeId },
-    MulByTwoToAdd { mul_node: base::NodeId },
-    DivByConstToMul { div_node: base::NodeId, reciprocal: f64 },
+    FastInvSqrt {
+        sqrt_node: base::NodeId,
+        div_node: base::NodeId,
+    },
+    SoftmaxOnline {
+        softmax_node: base::NodeId,
+    },
+    MulByTwoToAdd {
+        mul_node: base::NodeId,
+    },
+    DivByConstToMul {
+        div_node: base::NodeId,
+        reciprocal: f64,
+    },
 }
 
 pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {

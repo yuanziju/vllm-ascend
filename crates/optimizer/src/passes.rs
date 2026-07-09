@@ -75,16 +75,25 @@ mod tests {
     fn build_graph_with_dead_code() -> Graph {
         let mut g = Graph::new("test");
         let in0 = g.add_input(
-            Type::Tensor { dtype: DType::F32, dims: vec![2, 2] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
             Some("in0"),
         );
         let in1 = g.add_input(
-            Type::Tensor { dtype: DType::F32, dims: vec![2, 2] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
             Some("in1"),
         );
         let add = g.add_node(OpKind::Add);
         let out0 = g.add_value(
-            Type::Tensor { dtype: DType::F32, dims: vec![2, 2] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
             Some("out0"),
             add,
         );
@@ -93,7 +102,10 @@ mod tests {
         g.mark_output(out0);
         let relu = g.add_node(OpKind::Relu);
         let dead_out = g.add_value(
-            Type::Tensor { dtype: DType::F32, dims: vec![2, 2] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
             Some("dead"),
             relu,
         );

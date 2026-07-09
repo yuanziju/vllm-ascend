@@ -6,7 +6,9 @@ use std::str::Chars;
 
 /// 解析 S-expr 文本
 pub fn parse(src: &str) -> Result<Val, String> {
-    let mut p = Parser { chars: src.chars().peekable() };
+    let mut p = Parser {
+        chars: src.chars().peekable(),
+    };
     p.skip_ws();
     if p.chars.peek().is_none() {
         return Ok(Val::Nil);

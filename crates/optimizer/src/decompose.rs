@@ -29,7 +29,10 @@ pub fn run_decompose(graph: &mut Graph) -> Result<Vec<DecomposeResult>> {
             OpKind::Gelu => decompose_gelu(graph, id)?,
             _ => Vec::new(),
         };
-        results.push(DecomposeResult { original: id, expanded });
+        results.push(DecomposeResult {
+            original: id,
+            expanded,
+        });
     }
     Ok(results)
 }

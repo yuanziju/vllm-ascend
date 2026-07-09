@@ -278,7 +278,10 @@ impl std::fmt::Debug for Graph {
 
 impl Graph {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), raw: RawGraph::new() }
+        Self {
+            name: name.into(),
+            raw: RawGraph::new(),
+        }
     }
 
     #[inline]
@@ -327,7 +330,8 @@ impl Graph {
             }
         };
         let name_off = self.raw.add_name(name);
-        self.raw.alloc_value(tag as u8, rank, shape_off, name_off, def)
+        self.raw
+            .alloc_value(tag as u8, rank, shape_off, name_off, def)
     }
 
     pub fn add_input(&mut self, ty: Type, name: Option<&str>) -> ValueId {
@@ -358,7 +362,11 @@ impl Graph {
             .get(id as usize)
             .ok_or_else(|| NeutronError::Ir(format!("节点 ID {} 越界", id)))?;
         let kind = OpKind::from_u8(hdr.op_tag)?;
-        Ok(NodeView { id, kind, raw: &self.raw })
+        Ok(NodeView {
+            id,
+            kind,
+            raw: &self.raw,
+        })
     }
 
     pub fn value(&self, id: ValueId) -> Result<ValueView<'_>> {
@@ -368,7 +376,11 @@ impl Graph {
             .get(id as usize)
             .ok_or_else(|| NeutronError::Ir(format!("值 ID {} 越界", id)))?;
         let type_tag = TypeTag::from_u8(hdr.type_tag)?;
-        Ok(ValueView { id, type_tag, raw: &self.raw })
+        Ok(ValueView {
+            id,
+            type_tag,
+            raw: &self.raw,
+        })
     }
 
     pub fn node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
@@ -510,7 +522,11 @@ pub struct Operation {
 
 impl Operation {
     pub fn new(kind: OpKind) -> Self {
-        Self { kind, inputs: Vec::new(), outputs: Vec::new() }
+        Self {
+            kind,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
     }
 }
 

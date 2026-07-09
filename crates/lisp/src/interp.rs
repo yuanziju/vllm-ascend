@@ -16,9 +16,12 @@ impl Interp {
 
     pub fn eval(&mut self, v: &Val) -> Result<Val, String> {
         match v {
-            Val::Nil | Val::Bool(_) | Val::Int(_) | Val::Float(_) | Val::Str(_) | Val::Lambda { .. } => {
-                Ok(v.clone())
-            }
+            Val::Nil
+            | Val::Bool(_)
+            | Val::Int(_)
+            | Val::Float(_)
+            | Val::Str(_)
+            | Val::Lambda { .. } => Ok(v.clone()),
             Val::Sym(s) => self
                 .vars
                 .get(s)
@@ -38,10 +41,7 @@ impl Interp {
                         if is_true {
                             self.eval(items.get(2).ok_or("if 缺少真分支")?)
                         } else {
-                            items
-                                .get(3)
-                                .map(|v| self.eval(v))
-                                .unwrap_or(Ok(Val::Nil))
+                            items.get(3).map(|v| self.eval(v)).unwrap_or(Ok(Val::Nil))
                         }
                     }
                     "do" => {

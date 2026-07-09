@@ -18,10 +18,7 @@ pub enum Val {
     Sym(String),
     Str(String),
     List(Vec<Val>),
-    Lambda {
-        params: Vec<String>,
-        body: Vec<Val>,
-    },
+    Lambda { params: Vec<String>, body: Vec<Val> },
 }
 
 impl Val {

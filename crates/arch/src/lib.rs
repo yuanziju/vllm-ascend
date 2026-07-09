@@ -23,7 +23,10 @@ pub enum ArchOp {
 
 impl ArchGraph {
     pub fn new(target: common::Target) -> Self {
-        Self { ops: Vec::new(), target }
+        Self {
+            ops: Vec::new(),
+            target,
+        }
     }
     pub fn add(&mut self, op: ArchOp) {
         self.ops.push(op);

@@ -22,10 +22,16 @@ pub fn select(arch_graph: &ArchGraph) -> Result<Vec<Instruction>> {
                 });
             }
             ArchOp::Load => {
-                instrs.push(Instruction { op: "load".into(), args: Vec::new() });
+                instrs.push(Instruction {
+                    op: "load".into(),
+                    args: Vec::new(),
+                });
             }
             ArchOp::Store => {
-                instrs.push(Instruction { op: "store".into(), args: Vec::new() });
+                instrs.push(Instruction {
+                    op: "store".into(),
+                    args: Vec::new(),
+                });
             }
         }
     }

@@ -48,7 +48,10 @@ pub fn compile(input: Input, config: Config) -> Result<Output> {
     let arch_graph = arch::lower(&graph, config.target)?;
 
     if config.dump_ir {
-        debug.push_str(&format!("\n// === Lowering 后 ({} ops) ===\n", arch_graph.len()));
+        debug.push_str(&format!(
+            "\n// === Lowering 后 ({} ops) ===\n",
+            arch_graph.len()
+        ));
         for (i, op) in arch_graph.ops.iter().enumerate() {
             debug.push_str(&format!("  [{}] {:?}\n", i, op));
         }
@@ -58,7 +61,10 @@ pub fn compile(input: Input, config: Config) -> Result<Output> {
     let instructions = isel::select(&arch_graph)?;
 
     if config.dump_ir {
-        debug.push_str(&format!("\n// === 最终指令 ({} 条) ===\n", instructions.len()));
+        debug.push_str(&format!(
+            "\n// === 最终指令 ({} 条) ===\n",
+            instructions.len()
+        ));
         for (i, ins) in instructions.iter().enumerate() {
             debug.push_str(&format!("  [{}] {} {}\n", i, ins.op, ins.args.join(" ")));
         }

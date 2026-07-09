@@ -67,16 +67,25 @@ mod tests {
     fn cse_finds_redundant_add() {
         let mut g = Graph::new("test");
         let a = g.add_input(
-            Type::Tensor { dtype: DType::F32, dims: vec![2, 2] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
             Some("a"),
         );
         let b = g.add_input(
-            Type::Tensor { dtype: DType::F32, dims: vec![2, 2] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
             Some("b"),
         );
         let add1 = g.add_node(OpKind::Add);
         let out1 = g.add_value(
-            Type::Tensor { dtype: DType::F32, dims: vec![2, 2] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
             Some("c"),
             add1,
         );
@@ -84,7 +93,10 @@ mod tests {
         g.raw.set_node_outputs(add1, &[out1]);
         let add2 = g.add_node(OpKind::Add);
         let out2 = g.add_value(
-            Type::Tensor { dtype: DType::F32, dims: vec![2, 2] },
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
             Some("d"),
             add2,
         );
