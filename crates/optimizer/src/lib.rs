@@ -19,6 +19,7 @@ pub mod decompose;
 pub mod float_opts;
 pub mod fuse;
 pub mod passes;
+pub mod shape_infer;
 
 use base::{Graph, Pass, PassContext, Result};
 
@@ -42,6 +43,7 @@ impl PassManager {
         let mut pm = Self::new();
         pm.add(Box::new(passes::Verify));
         pm.add(Box::new(DecomposePass));
+        pm.add(Box::new(ShapeInferPass));
         pm.add(Box::new(ConstPropPass));
         pm.add(Box::new(AlgebraPass));
         pm.add(Box::new(ConstPropPass));
@@ -83,6 +85,22 @@ impl Pass for DecomposePass {
         let results = decompose::run_decompose(graph)?;
         ctx.inc("decompose_count");
         let _ = results;
+        Ok(())
+    }
+}
+
+struct ShapeInferPass;
+
+impl Pass for ShapeInferPass {
+    fn name(&self) -> &str {
+        "shape-infer"
+    }
+    fn run(&mut self, graph: &mut Graph, ctx: &mut PassContext) -> Result<()> {
+        let count = shape_infer::apply_shape_infer(graph)?;
+        if count > 0 {
+            ctx.inc("shape_infer_filled");
+            ctx.stats.insert("shape_infer_count".into(), count);
+        }
         Ok(())
     }
 }

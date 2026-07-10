@@ -129,6 +129,78 @@ fn val_to_str(v: &Val) -> String {
     }
 }
 
+/// 从规则文本源加载多条规则。源里每条规则用 `(rule ...)` 表示，
+/// 可有多条，之间空白分隔。注释以 `;` 开头到行尾。
+/// 例：
+/// ```text
+/// ; add 规则
+/// (rule (when (= op "add")) (emit "fadd" "r0" "r1"))
+/// (rule (when (= op "mul")) (emit "fmul" "r0" "r1"))
+/// ```
+pub fn load_rules_from_src(src: &str) -> Result<Vec<Rule>> {
+    // 顶层可能有多个 (rule ...)。用括号配平切分。
+    let mut rules = Vec::new();
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // 跳过空白和注释
+        let b = bytes[i];
+        if b == b';' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b != b'(' {
+            return Err(NeutronError::Isel(format!(
+                "规则源第 {} 字节处期望 '('，得到 {:?}",
+                i, b as char
+            )));
+        }
+        // 配平括号，截取一个完整 S-expr
+        let start = i;
+        let mut depth = 0i32;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                b';' => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            return Err(NeutronError::Isel("规则源括号不配平".into()));
+        }
+        let expr = &src[start..=i];
+        i += 1; // 跳过 ')'
+        let rule = parse_rule(expr)?;
+        rules.push(rule);
+    }
+    Ok(rules)
+}
+
+/// 从文件路径加载规则集（热加载，不重编译）。文件格式同 [`load_rules_from_src`]。
+pub fn load_rules_from_file(path: &str) -> Result<Vec<Rule>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| NeutronError::Isel(format!("读取规则文件 {} 失败: {}", path, e)))?;
+    load_rules_from_src(&content)
+}
+
 /// 对单个 ArchOp 应用规则集，返回匹配到的指令（取第一条命中规则）
 fn select_one(
     op_name: &str,
@@ -289,5 +361,51 @@ mod tests {
         // 这条规则不依赖 op，true 恒命中
         let ins = select_with_rules(&ag, &[rule]).unwrap();
         assert!(ins[0].op.contains("load_"));
+    }
+
+    #[test]
+    fn load_multiple_rules_from_src() {
+        let src = r#"
+            ; add 规则
+            (rule (when (= op "add")) (emit "fadd" "r0" "r1"))
+            ; mul 规则
+            (rule (when (= op "mul")) (emit "fmul" "r0" "r1"))
+        "#;
+        let rules = load_rules_from_src(src).unwrap();
+        assert_eq!(rules.len(), 2, "应加载 2 条规则");
+        // 用加载的规则选 add
+        let ag = make_arch(Target::Cuda, vec![ArchOp::KernelCall("add".into())]);
+        let ins = select_with_rules(&ag, &rules).unwrap();
+        assert_eq!(ins[0].op, "fadd");
+    }
+
+    #[test]
+    fn load_rules_from_file_works() {
+        // 写临时规则文件
+        let path = "/tmp/neutron_isel_test.rules";
+        let content = r#"
+            (rule (when (= op "custom_op")) (emit "my_instr" "a"))
+        "#;
+        std::fs::write(path, content).unwrap();
+        let rules = load_rules_from_file(path).unwrap();
+        assert_eq!(rules.len(), 1);
+        let ag = make_arch(Target::Cuda, vec![ArchOp::KernelCall("custom_op".into())]);
+        let ins = select_with_rules(&ag, &rules).unwrap();
+        assert_eq!(ins[0].op, "my_instr");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn unbalanced_parens_error() {
+        let src = r#"(rule (when (= op "add") (emit "fadd"))"#; // 少一个 )
+        let err = load_rules_from_src(src).unwrap_err();
+        assert!(matches!(err, NeutronError::Isel(_)));
+    }
+
+    #[test]
+    fn comments_stripped() {
+        let src = "; 整行注释\n(rule (when true) (emit \"x\"))\n; 末尾注释";
+        let rules = load_rules_from_src(src).unwrap();
+        assert_eq!(rules.len(), 1);
     }
 }

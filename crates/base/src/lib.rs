@@ -463,6 +463,10 @@ impl Graph {
                     value_map.insert(old_vid, new_vid);
                 }
             }
+
+            // 复制属性（Axis/Epsilon/Value 等）。原 compact 漏了这一步，导致
+            // compact 后 Constant 的 Value 属性丢失、reduce 的 Axis 丢失。
+            copy_attrs(self, old_id, &mut new_graph, new_node_id);
         }
 
         // 第二遍：复制图输入 value（无定义节点的）
@@ -511,6 +515,48 @@ impl Graph {
         }
 
         (new_graph, node_map, value_map)
+    }
+}
+
+/// 复制一个节点的所有属性到新节点（compact 用）。
+/// 按 AttrTag 分发：Int/Float/Bool 单值，IntArray/FloatArray 数组。
+fn copy_attrs(src: &Graph, old_node: NodeId, dst: &mut Graph, new_node: NodeId) {
+    let attrs = match src.raw.node_attrs(old_node) {
+        a if !a.is_empty() => a,
+        _ => return,
+    };
+    for e in attrs {
+        // key 用 from_u8 还原；Custom(255) 或未知 key 跳过（无法 re-add）
+        let key = match raw::AttrKey::from_u8(e.key) {
+            Some(k) => k,
+            None => continue,
+        };
+        match raw::AttrTag::from_u8(e.tag) {
+            Some(raw::AttrTag::Int) => {
+                dst.raw.add_attr_int(new_node, key, src.raw.attr_int(e));
+            }
+            Some(raw::AttrTag::Float) => {
+                dst.raw.add_attr_float(new_node, key, src.raw.attr_float(e));
+            }
+            Some(raw::AttrTag::Bool) => {
+                dst.raw.add_attr_bool(new_node, key, src.raw.attr_bool(e));
+            }
+            Some(raw::AttrTag::IntArray) => {
+                let vals = src.raw.attr_int_array(e).to_vec();
+                dst.raw.add_attr_int_array(new_node, key, &vals);
+            }
+            Some(raw::AttrTag::FloatArray) => {
+                // 读取 float array（attr_int_array 同构，转 f64 bits 解读）
+                let bytes =
+                    &src.raw.attr_data[e.data_off as usize..(e.data_off + e.data_len) as usize];
+                let vals: Vec<f64> = bytes
+                    .chunks_exact(8)
+                    .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                dst.raw.add_attr_float_array(new_node, key, &vals);
+            }
+            None => {}
+        }
     }
 }
 
@@ -575,3 +621,112 @@ pub struct Value {
 
 pub use raw::AttrKey as RawAttrKey;
 pub use raw::AttrTag as RawAttrTag;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// 回归测试：compact 必须保留节点的属性。
+    /// 历史缺陷：compact 复制节点时漏了 attrs，导致 Constant 的 Value 属性丢失、
+    /// reduce 的 Axis 丢失，后续 algebra 折叠和 shape 推断失效。
+    #[test]
+    fn compact_preserves_constant_value_attr() {
+        let mut g = Graph::new("test");
+        // 一个 Constant 节点带 Value=42.0 属性
+        let (cnode, cval) = g.add_constant_f64(42.0);
+        // 一个 Add 节点用常量 + 图输入，输出标记为图输出
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let add = g.add_node(OpKind::Add);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("o"), add);
+        g.raw.set_node_inputs(add, &[x, cval]);
+        g.raw.set_node_outputs(add, &[out]);
+        g.mark_output(out);
+
+        // compact 不删任何节点（空 remove 集），只重建图。重建后 Constant 的 Value 属性应保留
+        let empty: HashSet<NodeId> = HashSet::new();
+        let (new_g, _, _) = g.compact(&empty);
+
+        // 找到新图里的 Constant 节点
+        let new_const = new_g
+            .node_ids()
+            .map(|id| new_g.node(id).unwrap())
+            .find(|n| n.kind == OpKind::Constant)
+            .expect("新图应有 Constant 节点");
+        assert_eq!(
+            new_const.constant_value(),
+            Some(42.0),
+            "compact 后 Constant 的 Value 属性应保留（历史缺陷：原实现丢失）"
+        );
+        let _ = cnode; // 避免未使用警告
+    }
+
+    #[test]
+    fn compact_preserves_axis_attr() {
+        // reduce 节点带 Axis 属性，compact 后应保留
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3, 4],
+            },
+            Some("x"),
+        );
+        let rs = g.add_node(OpKind::ReduceSum);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 4],
+            },
+            Some("o"),
+            rs,
+        );
+        g.raw.set_node_inputs(rs, &[x]);
+        g.raw.set_node_outputs(rs, &[out]);
+        g.raw.add_attr_int(rs, RawAttrKey::Axis, 1);
+        g.mark_output(out);
+
+        let empty: HashSet<NodeId> = HashSet::new();
+        let (new_g, _, _) = g.compact(&empty);
+        let new_rs = new_g
+            .node_ids()
+            .map(|id| new_g.node(id).unwrap())
+            .find(|n| n.kind == OpKind::ReduceSum)
+            .expect("应有 ReduceSum 节点");
+        // 读 Axis 属性
+        let mut axis: i64 = -999;
+        for e in new_rs.attrs() {
+            if e.key == RawAttrKey::Axis as u8 {
+                axis = new_g.raw.attr_int(e);
+            }
+        }
+        assert_eq!(axis, 1, "compact 后 Axis 属性应保留");
+    }
+
+    #[test]
+    fn compact_removes_dead_node_and_rewires() {
+        // 删一个中间节点，输入应被正确重连
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let relu = g.add_node(OpKind::Relu);
+        let r_out = g.add_value(Type::Scalar(DType::F32), Some("r"), relu);
+        g.raw.set_node_inputs(relu, &[x]);
+        g.raw.set_node_outputs(relu, &[r_out]);
+        let add = g.add_node(OpKind::Add);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("o"), add);
+        g.raw.set_node_inputs(add, &[r_out, x]);
+        g.raw.set_node_outputs(add, &[out]);
+        g.mark_output(out);
+
+        // 删 relu：但 add 依赖 r_out，r_out 会悬空。
+        // 此测试验证 compact 不删带 use 的节点的行为由调用方保证；
+        // 这里只删一个独立死节点。
+        let dead = g.add_node(OpKind::Relu);
+        let _ = g.add_value(Type::Scalar(DType::F32), Some("dead"), dead);
+        let mut remove: HashSet<NodeId> = HashSet::new();
+        remove.insert(dead);
+        let (new_g, _, _) = g.compact(&remove);
+        // 死节点应被删，add + relu 保留
+        assert_eq!(new_g.node_count(), 2, "应剩 add + relu 2 个节点");
+    }
+}

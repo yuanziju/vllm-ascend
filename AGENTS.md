@@ -205,3 +205,30 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 4. isel 规则从文件加载（热加载，不重编译）
 5. frontend：解析 ONNX 属性（axis/epsilon 等），喂给 decompose 的 read_axis/read_epsilon
 6. pt 前端：PyTorch 解析（当前占位）
+
+### 2026-07-10 — shape 推断 + isel 文件热加载 + 底层存储 compact 属性修复（feat/neutron-5f1c5deb）
+
+**当前状态**：新增 shape 推断 pass 让 cost_model 估算更准；isel 规则支持从文件热加载；修复底层存储 compact 丢失属性的 critical bug。回归全绿，本分支待合并回 main。
+
+**已完成**：
+- **shape 推断 pass**（optimizer/shape_infer.rs）：elementwise 广播 + reduce 沿轴消维 + MatMul [m,k]×[k,n]→[m,n]；不动点迭代，两阶段模式（先收集 to_fill Vec 再应用，解决 borrow 冲突）；所有 op 加 shape_known 守卫，要求输入 shape 全已知才推，避免用未知输入推出错误 shape 被锁定。`set_value_shape` 回填。注册到 DecomposePass 之后。6 单测
+- **isel 规则文件热加载**（isel/lib.rs）：`load_rules_from_src`（括号配平切分多条规则 + `;` 注释支持）+ `load_rules_from_file`（从路径加载不重编译）。4 单测
+- **底层存储 compact 属性丢失修复**（base/lib.rs + base/raw.rs，critical bug）：原 compact 复制节点时漏拷 attrs，导致 Constant 的 Value 丢失、reduce 的 Axis 丢失——任何经过 compact 的图都受影响，algebra 折叠在 decompose（调 compact）之后失效。修复：新增 `copy_attrs` 辅助按 AttrTag 分发复制；底层存储层补 `AttrTag::from_u8` + `add_attr_float_array` + `set_value_shape`。3 回归测试
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：70 passed (base 3 + common 2 + frontend 13 + interface 1 + isel 12 + lisp 4 + optimizer 35)
+
+**设计哲学遵守**：shape 推断让 cost_model 有准确估算（FLOPs + memory access 需 shape），符合"cost model 现在就做"。compact 属性修复是审查底层数据结构发现的 critical 问题——纯函数式 SSA 重排自由的前提是图变换不丢信息，compact 丢属性破坏了这个前提。isel 文件热加载符合"规则用函数实现，后期再抽象"。
+
+**避嫌规范**：本轮起，输出与新写注释避免使用某些英文技术词的中文翻译（该翻译在中文语境敏感），改用"底层存储"等中性表述；现有文件名/类型名保持现状（重命名核心类型是大改动，后续轮专门做）。
+
+**下一步**（优先级排序）：
+1. 合并 feat/neutron-5f1c5deb → main
+2. 底层存储模块/类型重命名（去除敏感词，需全量替换引用，大改动单独一轮）
+3. algebra 扩展：常量传播、shape 推断后基于 shape 的简化
+4. fuse 可扩展：reduce + elementwise 融合
+5. frontend：解析 ONNX 属性（axis/epsilon 等），喂给 decompose
+6. pt 前端：PyTorch 解析

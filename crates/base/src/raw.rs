@@ -111,6 +111,19 @@ pub enum AttrTag {
     FloatArray = 4,
 }
 
+impl AttrTag {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Int),
+            1 => Some(Self::Float),
+            2 => Some(Self::Bool),
+            3 => Some(Self::IntArray),
+            4 => Some(Self::FloatArray),
+            _ => None,
+        }
+    }
+}
+
 /// 属性条目（12 字节定长头 + data 在 attr_data 池）
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -285,6 +298,23 @@ impl RawGraph {
             AttrEntry {
                 key: key as u8,
                 tag: AttrTag::IntArray as u8,
+                _pad: [0; 2],
+                data_off,
+                data_len: (vals.len() * 8) as u32,
+            },
+        );
+    }
+
+    pub fn add_attr_float_array(&mut self, node: u32, key: AttrKey, vals: &[f64]) {
+        let data_off = self.attr_data.len() as u32;
+        for v in vals {
+            self.attr_data.extend_from_slice(&v.to_le_bytes());
+        }
+        self.push_attr(
+            node,
+            AttrEntry {
+                key: key as u8,
+                tag: AttrTag::FloatArray as u8,
                 _pad: [0; 2],
                 data_off,
                 data_len: (vals.len() * 8) as u32,
