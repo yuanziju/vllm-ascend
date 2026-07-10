@@ -10,6 +10,8 @@
 //! - **ReciprocalSqrt 融合**：`Reciprocal(Sqrt(x))` → `Rsqrt(x)`（2 op 降 1 op）。
 //!   同 `1/√x = x^(-1/2)` 恒等式。ONNX 的 Reciprocal(Sqrt(...)) 模式（RMSNorm 常见）
 //!   原本需两 op，融成单 Rsqrt。
+//! - **DivByReciprocal 融合**：`a / Reciprocal(b)` → `Mul(a, b)`（消去 Reciprocal+Div，
+//!   换便宜 Mul）。恒等式 `a/(1/b) = a·b`。除以倒数等于乘原数。
 //! - **DivByConstToMul**：`x / c` → `x * (1/c)`。除法 latency 远高于乘法，
 //!   预计算倒数转成乘法。注意：对 c=0 不做；浮点倒数有精度损失但可接受。
 //! - **MulByTwoToAdd**：`x * 2.0` → `x + x`。乘以 2 的幂可用 IEEE754 位级
@@ -50,6 +52,12 @@ pub enum FloatOpt {
         sqrt_node: base::NodeId,
         sqrt_input: ValueId,
     },
+    /// `a / Reciprocal(b)` → `Mul(a, b)`（消去 Reciprocal+Div 换便宜 Mul）。a/(1/b)=a·b
+    DivByReciprocal {
+        div_node: base::NodeId,
+        numerator: ValueId,
+        recip_input: ValueId,
+    },
 }
 
 pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
@@ -59,6 +67,9 @@ pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
         match n.kind {
             OpKind::Div => {
                 if let Some(opt) = try_match_fast_inv_sqrt(graph, n)? {
+                    opts.push(opt);
+                }
+                if let Some(opt) = try_match_div_by_reciprocal(graph, n)? {
                     opts.push(opt);
                 }
                 if let Some(opt) = try_match_div_by_const(graph, n)? {
@@ -141,6 +152,33 @@ fn try_match_reciprocal_sqrt(graph: &Graph, recip: NodeView) -> Result<Option<Fl
         recip_node: recip.id,
         sqrt_node: input_def,
         sqrt_input,
+    }))
+}
+
+/// 识别 `a / Reciprocal(b)`：Div 节点，除数(ins[1]) 是 Reciprocal 节点输出。
+/// `a/(1/b) = a·b`，消去 Reciprocal+Div 换便宜 Mul。注意：只匹配除数是 Reciprocal
+/// （分子是 Reciprocal 不匹配，那是 Reciprocal(a)/b 无此恒等式）
+fn try_match_div_by_reciprocal(graph: &Graph, div: NodeView) -> Result<Option<FloatOpt>> {
+    let ins = div.inputs();
+    if ins.len() != 2 {
+        return Ok(None);
+    }
+    let (numerator, divisor) = (ins[0], ins[1]);
+    let divisor_def = graph.value(divisor)?.def_node();
+    if divisor_def == u32::MAX {
+        return Ok(None);
+    }
+    let divisor_node = graph.node(divisor_def)?;
+    if divisor_node.kind != OpKind::Reciprocal {
+        return Ok(None);
+    }
+    let Some(&recip_input) = divisor_node.inputs().first() else {
+        return Ok(None);
+    };
+    Ok(Some(FloatOpt::DivByReciprocal {
+        div_node: div.id,
+        numerator,
+        recip_input,
     }))
 }
 
@@ -269,6 +307,19 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                 // 输入换成 x。输出 value 不变（使用者无感），Sqrt 变孤儿交给 DCE
                 graph.storage.set_node_inputs(recip_node, &[sqrt_input]);
                 graph.storage.node_hdr[recip_node as usize].op_tag = OpKind::Rsqrt as u8;
+                applied += 1;
+            }
+            FloatOpt::DivByReciprocal {
+                div_node,
+                numerator,
+                recip_input,
+            } => {
+                // a / Reciprocal(b) → Mul(a, b)：把 Div 节点改成 Mul，输入换成 [a, b]。
+                // 输出 value 不变，Reciprocal 节点变孤儿交给 DCE
+                graph
+                    .storage
+                    .set_node_inputs(div_node, &[numerator, recip_input]);
+                graph.storage.node_hdr[div_node as usize].op_tag = OpKind::Mul as u8;
                 applied += 1;
             }
             FloatOpt::SoftmaxOnline { .. } => {
@@ -573,6 +624,55 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, FloatOpt::ReciprocalSqrt { .. })),
             "Reciprocal(x) 输入非 Sqrt 不应触发 ReciprocalSqrt"
+        );
+    }
+
+    /// `a / Reciprocal(b)` → `Mul(a, b)`（消去 Reciprocal+Div 换便宜 Mul）
+    #[test]
+    fn div_by_reciprocal_becomes_mul() {
+        let mut g = Graph::new("test");
+        let a = g.add_input(Type::Scalar(DType::F32), Some("a"));
+        let b = g.add_input(Type::Scalar(DType::F32), Some("b"));
+        let recip = g.add_node(OpKind::Reciprocal);
+        let recip_out = g.add_value(Type::Scalar(DType::F32), Some("ro"), recip);
+        g.storage.set_node_inputs(recip, &[b]);
+        g.storage.set_node_outputs(recip, &[recip_out]);
+        let div = g.add_node(OpKind::Div);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), div);
+        g.storage.set_node_inputs(div, &[a, recip_out]);
+        g.storage.set_node_outputs(div, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let n = g.node(div).unwrap();
+        assert_eq!(n.kind, OpKind::Mul, "a/Reciprocal(b) 的 Div 应改成 Mul");
+        assert_eq!(n.inputs(), &[a, b], "Mul 输入应为 [a, b]");
+    }
+
+    /// `Reciprocal(a) / b`（Reciprocal 是分子不是除数）不应触发 DivByReciprocal
+    #[test]
+    fn reciprocal_as_numerator_not_matched() {
+        let mut g = Graph::new("test");
+        let a = g.add_input(Type::Scalar(DType::F32), Some("a"));
+        let b = g.add_input(Type::Scalar(DType::F32), Some("b"));
+        let recip = g.add_node(OpKind::Reciprocal);
+        let recip_out = g.add_value(Type::Scalar(DType::F32), Some("ro"), recip);
+        g.storage.set_node_inputs(recip, &[a]);
+        g.storage.set_node_outputs(recip, &[recip_out]);
+        let div = g.add_node(OpKind::Div);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), div);
+        // recip_out 是分子（ins[0]），b 是除数（ins[1]）→ 不应触发 DivByReciprocal
+        g.storage.set_node_inputs(div, &[recip_out, b]);
+        g.storage.set_node_outputs(div, &[out]);
+        g.mark_output(out);
+
+        let opts = find_opportunities(&g).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, FloatOpt::DivByReciprocal { .. })),
+            "Reciprocal(a)/b 不应触发 DivByReciprocal（除数不是 Reciprocal）"
         );
     }
 }
