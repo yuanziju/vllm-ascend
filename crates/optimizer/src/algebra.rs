@@ -5,6 +5,10 @@
 //! - 不硬编码复合算子模式（MatMul+Add→Linear 这种留给 fuse）
 //! - 有 NaN/Inf 风险的规则（x-x=0、x/x=1）默认禁用，由 `AlgebraConfig.unsafe_opts` 开关控制
 //!
+//! shape-based 简化：除了标量 0/1，还识别"全 0 / 全 1 张量"（多元素 Constant
+//! FloatArray，如 ONNX initializer 的 ones/zeros）。x + zeros→x、x * ones→x、
+//! x * zeros→复用那个 zeros 张量（保留 shape，不退化为标量）。
+//!
 //! 应用方式：`simplify` 是纯函数返回建议；`run_algebraic_simplify` 收集
 //! (old_value → new_value) 替换映射，重写所有节点 inputs，被替换的节点留给 DCE 清理。
 
@@ -104,10 +108,14 @@ fn simplify_mul(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
     if is_constant_one(graph, a)? {
         return Ok(SimplifyResult::ReplaceWith(b));
     }
-    // x * 0 = 0 (注意：对 NaN 不安全，NaN*0=NaN，但 0 是比 x 更"确定"的值，
-    // 且 x 若含 NaN 则结果本就不确定。此处保守返回 0，因 x*0 数学上=0)
-    if is_constant_zero(graph, b)? || is_constant_zero(graph, a)? {
-        return Ok(SimplifyResult::FoldToConstant(0.0));
+    // x * 0 = 0：复用那个 0 张量（保留 shape，比 FoldToConstant 标量更准）
+    // 注意：对 NaN 不安全（NaN*0=NaN），但 0 是比 x 更"确定"的值，
+    // 且 x 若含 NaN 则结果本就不确定。此处保守返回那个 0 张量
+    if is_constant_zero(graph, b)? {
+        return Ok(SimplifyResult::ReplaceWith(b));
+    }
+    if is_constant_zero(graph, a)? {
+        return Ok(SimplifyResult::ReplaceWith(a));
     }
     Ok(SimplifyResult::NoChange)
 }
@@ -247,12 +255,39 @@ fn constant_value(graph: &Graph, v: ValueId) -> Result<Option<f64>> {
     Ok(node.constant_value())
 }
 
+/// 判断常量张量是否"所有元素都等于 target"。
+///
+/// 覆盖三种存储形式：
+/// - 标量 Constant（Value=Float）：直接比 target
+/// - 单元素张量 Constant（Value=FloatArray 且 len==1）：取该元素
+/// - 多元素张量 Constant（Value=FloatArray 且 len>1）：全等检查
+///
+/// 非常量或空张量返回 false。这让 algebra 能识别 ONNX initializer 的
+/// ones/zeros（多元素全 1/全 0 张量），不仅限于标量 0/1。
+fn constant_is_uniform(graph: &Graph, v: ValueId, target: f64) -> Result<bool> {
+    let val = graph.value(v)?;
+    let def = val.def_node();
+    if def == u32::MAX {
+        return Ok(false);
+    }
+    let node = graph.node(def)?;
+    // 标量 / 单元素：constant_value 即可
+    if let Some(scalar) = node.constant_value() {
+        return Ok(scalar == target);
+    }
+    // 多元素张量：全等检查
+    if let Some(tensor) = node.constant_tensor() {
+        return Ok(!tensor.is_empty() && tensor.iter().all(|&x| x == target));
+    }
+    Ok(false)
+}
+
 fn is_constant_zero(graph: &Graph, v: ValueId) -> Result<bool> {
-    Ok(constant_value(graph, v)?.map(|f| f == 0.0).unwrap_or(false))
+    constant_is_uniform(graph, v, 0.0)
 }
 
 fn is_constant_one(graph: &Graph, v: ValueId) -> Result<bool> {
-    Ok(constant_value(graph, v)?.map(|f| f == 1.0).unwrap_or(false))
+    constant_is_uniform(graph, v, 1.0)
 }
 
 /// 应用代数简化到整个图。
@@ -658,5 +693,142 @@ mod tests {
         // 输入非常量，不应折叠
         let count = run_algebraic_simplify(&mut g).unwrap();
         assert_eq!(count, 0);
+    }
+
+    // --- shape-based 简化（多元素全 0/全 1 张量）---
+
+    /// 构造一个多元素 Constant 张量节点（Value=FloatArray），shape=dims，值=vals。
+    fn add_constant_tensor(g: &mut Graph, dims: &[i64], vals: &[f64], name: &str) -> ValueId {
+        let node = g.add_node(OpKind::Constant);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: dims.to_vec(),
+            },
+            Some(name),
+            node,
+        );
+        g.storage.set_node_outputs(node, &[out]);
+        g.storage
+            .add_attr_float_array(node, base::StorageAttrKey::Value, vals);
+        out
+    }
+
+    #[test]
+    fn mul_with_ones_tensor_simplifies() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        // ones [2,3] 全 1
+        let ones = add_constant_tensor(&mut g, &[2, 3], &[1.0; 6], "ones");
+        let mul = g.add_node(OpKind::Mul);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            mul,
+        );
+        g.storage.set_node_inputs(mul, &[x, ones]);
+        g.storage.set_node_outputs(mul, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1, "x*ones 应简化为 x");
+        assert_eq!(g.outputs(), &[x], "输出应重写为 x");
+    }
+
+    #[test]
+    fn add_with_zeros_tensor_simplifies() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let zeros = add_constant_tensor(&mut g, &[2, 3], &[0.0; 6], "zeros");
+        let add = g.add_node(OpKind::Add);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            add,
+        );
+        g.storage.set_node_inputs(add, &[x, zeros]);
+        g.storage.set_node_outputs(add, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1, "x+zeros 应简化为 x");
+        assert_eq!(g.outputs(), &[x], "输出应重写为 x");
+    }
+
+    #[test]
+    fn mul_with_zeros_tensor_replaced() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let zeros = add_constant_tensor(&mut g, &[2, 3], &[0.0; 6], "zeros");
+        let mul = g.add_node(OpKind::Mul);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            mul,
+        );
+        g.storage.set_node_inputs(mul, &[x, zeros]);
+        g.storage.set_node_outputs(mul, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1, "x*zeros 应简化");
+        // 结果应复用那个 zeros 张量（保留 shape，不退化为标量）
+        assert_eq!(
+            g.outputs(),
+            &[zeros],
+            "输出应重写为 zeros 张量本身（保留 shape）"
+        );
+    }
+
+    #[test]
+    fn non_uniform_tensor_not_simplified() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
+            Some("x"),
+        );
+        // [1, 0, 1, 0] 非全 1 也非全 0，不应触发 x*ones/x*zeros
+        let mixed = add_constant_tensor(&mut g, &[2, 2], &[1.0, 0.0, 1.0, 0.0], "mixed");
+        let mul = g.add_node(OpKind::Mul);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
+            Some("out"),
+            mul,
+        );
+        g.storage.set_node_inputs(mul, &[x, mixed]);
+        g.storage.set_node_outputs(mul, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0, "非均匀张量不应简化");
     }
 }
