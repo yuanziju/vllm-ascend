@@ -178,6 +178,9 @@ pub enum OpKind {
     /// 融合而来（`a/√b = a·b^(-1/2)`）。后端 lowering 可用 0x5f3759df 魔数 bit trick 实现
     /// （Quake III fast inverse sqrt）。RMSNorm / LayerNorm 等 normalization 到处出现
     Rsqrt = 26,
+    /// Reciprocal：1/x 单 op。ONNX Reciprocal 算子映射而来。float_opts 把
+    /// `Reciprocal(Sqrt(x))` 融合成 `Rsqrt(x)`（1/√x = x^(-1/2)，同 FastInvSqrt 恒等式）
+    Reciprocal = 28,
     /// Fused：多对一融合结果（fuse pass 把 elementwise 链合成单节点）。attr 记 op 序列
     /// (Shape,IntArray) + side input 位置 (Strides,IntArray) + 可选 reduce 轴 (Axis,Int)，
     /// 供 lowering 重建子图。**与 Custom 区分**：Custom 留给未知 ONNX 算子（attr 记原始
@@ -217,6 +220,7 @@ impl OpKind {
             25 => Ok(Self::ReduceMax),
             26 => Ok(Self::Rsqrt),
             27 => Ok(Self::Fused),
+            28 => Ok(Self::Reciprocal),
             64 => Ok(Self::Custom),
             _ => Err(NeutronError::Ir(format!("未知 op tag: {}", v))),
         }

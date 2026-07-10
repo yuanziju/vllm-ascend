@@ -600,6 +600,7 @@ fn map_op_type(op_type: &str) -> OpKind {
         "Sqrt" => OpKind::Sqrt,
         "Exp" => OpKind::Exp,
         "Pow" => OpKind::Pow,
+        "Reciprocal" => OpKind::Reciprocal,
         "ReduceSum" | "ReduceL1" | "ReduceL2" => OpKind::ReduceSum,
         "ReduceMean" => OpKind::ReduceMean,
         "ReduceMax" => OpKind::ReduceMax,

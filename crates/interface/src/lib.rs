@@ -241,9 +241,12 @@ mod tests {
         pm.run(&mut graph).unwrap();
 
         // float_opts 应把 decompose 产生的 Div(1,Sqrt) 融合成 Rsqrt
-        let has_rsqrt = graph
-            .node_ids()
-            .any(|id| graph.node(id).map(|n| n.kind == base::OpKind::Rsqrt).unwrap_or(false));
+        let has_rsqrt = graph.node_ids().any(|id| {
+            graph
+                .node(id)
+                .map(|n| n.kind == base::OpKind::Rsqrt)
+                .unwrap_or(false)
+        });
         assert!(
             has_rsqrt,
             "LayerNorm 经 decompose + float_opts 后应出现 Rsqrt 节点（1/sqrt 融合）"
@@ -256,9 +259,12 @@ mod tests {
         assert!(has_rsqrt_instr, "isel 应为 Rsqrt 选出 'rsqrt' 指令");
         // 若 fusion 产生了 Fused 节点，应选出 "fused" 指令（不崩在 lowering）
         let has_fused_instr = instrs.iter().any(|i| i.op == "fused");
-        let has_fused_node = graph
-            .node_ids()
-            .any(|id| graph.node(id).map(|n| n.kind == base::OpKind::Fused).unwrap_or(false));
+        let has_fused_node = graph.node_ids().any(|id| {
+            graph
+                .node(id)
+                .map(|n| n.kind == base::OpKind::Fused)
+                .unwrap_or(false)
+        });
         assert_eq!(
             has_fused_instr, has_fused_node,
             "Fused 节点与 'fused' 指令应一致出现"

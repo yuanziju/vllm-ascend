@@ -22,6 +22,7 @@ pub fn lower(graph: &Graph, _target: common::Target) -> Result<ArchGraph> {
             OpKind::Conv => "conv",
             OpKind::Sqrt => "sqrt",
             OpKind::Rsqrt => "rsqrt",
+            OpKind::Reciprocal => "reciprocal",
             OpKind::Exp => "exp",
             OpKind::Pow => "pow",
             OpKind::ReduceSum => "reduce_sum",

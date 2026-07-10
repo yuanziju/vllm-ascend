@@ -7,6 +7,9 @@
 //!   2 op 降 1 op）。恒等式 `a/√b = a·b^(-1/2)`，把 Sqrt+Div（含一个贵的 Div）融成
 //!   Rsqrt（单条硬件指令 / 0x5f3759df 魔数 bit trick，Quake III fast inverse sqrt）+ 便宜的 Mul。
 //!   RMSNorm/LayerNorm 等 normalization 到处出现。这是浮点结构优化，不是贪心模式匹配。
+//! - **ReciprocalSqrt 融合**：`Reciprocal(Sqrt(x))` → `Rsqrt(x)`（2 op 降 1 op）。
+//!   同 `1/√x = x^(-1/2)` 恒等式。ONNX 的 Reciprocal(Sqrt(...)) 模式（RMSNorm 常见）
+//!   原本需两 op，融成单 Rsqrt。
 //! - **DivByConstToMul**：`x / c` → `x * (1/c)`。除法 latency 远高于乘法，
 //!   预计算倒数转成乘法。注意：对 c=0 不做；浮点倒数有精度损失但可接受。
 //! - **MulByTwoToAdd**：`x * 2.0` → `x + x`。乘以 2 的幂可用 IEEE754 位级
@@ -41,6 +44,12 @@ pub enum FloatOpt {
         div_node: base::NodeId,
         reciprocal: f64,
     },
+    /// `Reciprocal(Sqrt(x))` → `Rsqrt(x)`（2 op 降 1 op）。同 1/√x = x^(-1/2) 恒等式
+    ReciprocalSqrt {
+        recip_node: base::NodeId,
+        sqrt_node: base::NodeId,
+        sqrt_input: ValueId,
+    },
 }
 
 pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
@@ -61,6 +70,11 @@ pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
             }
             OpKind::Mul => {
                 if let Some(opt) = try_match_mul_by_two(graph, n)? {
+                    opts.push(opt);
+                }
+            }
+            OpKind::Reciprocal => {
+                if let Some(opt) = try_match_reciprocal_sqrt(graph, n)? {
                     opts.push(opt);
                 }
             }
@@ -100,6 +114,33 @@ fn try_match_fast_inv_sqrt(graph: &Graph, div: NodeView) -> Result<Option<FloatO
         numerator,
         sqrt_input,
         numerator_is_one,
+    }))
+}
+
+/// 识别 `Reciprocal(Sqrt(x))`：Reciprocal 节点，输入(ins[0]) 是 Sqrt 节点输出。
+/// `1/√x = x^(-1/2)` 融合为 Rsqrt（2 op 降 1 op）。
+/// ONNX 的 Reciprocal(Sqrt(...)) 是 RMSNorm 常见模式（比 Div(1,Sqrt) 另一种写法）
+fn try_match_reciprocal_sqrt(graph: &Graph, recip: NodeView) -> Result<Option<FloatOpt>> {
+    let ins = recip.inputs();
+    if ins.len() != 1 {
+        return Ok(None);
+    }
+    let input = ins[0];
+    let input_def = graph.value(input)?.def_node();
+    if input_def == u32::MAX {
+        return Ok(None);
+    }
+    let input_node = graph.node(input_def)?;
+    if input_node.kind != OpKind::Sqrt {
+        return Ok(None);
+    }
+    let Some(&sqrt_input) = input_node.inputs().first() else {
+        return Ok(None);
+    };
+    Ok(Some(FloatOpt::ReciprocalSqrt {
+        recip_node: recip.id,
+        sqrt_node: input_def,
+        sqrt_input,
     }))
 }
 
@@ -185,7 +226,9 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                     );
                     graph.storage.set_node_inputs(rsqrt_node, &[sqrt_input]);
                     graph.storage.set_node_outputs(rsqrt_node, &[rsqrt_out]);
-                    graph.storage.set_node_inputs(div_node, &[numerator, rsqrt_out]);
+                    graph
+                        .storage
+                        .set_node_inputs(div_node, &[numerator, rsqrt_out]);
                     graph.storage.node_hdr[div_node as usize].op_tag = OpKind::Mul as u8;
                 }
                 applied += 1;
@@ -215,6 +258,17 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                 // 把 Mul 节点的 op 改成 Add，输入改成 [x, x]
                 graph.storage.set_node_inputs(mul_node, &[x_input, x_input]);
                 graph.storage.node_hdr[mul_node as usize].op_tag = OpKind::Add as u8;
+                applied += 1;
+            }
+            FloatOpt::ReciprocalSqrt {
+                recip_node,
+                sqrt_node: _,
+                sqrt_input,
+            } => {
+                // Reciprocal(Sqrt(x)) → Rsqrt(x)：把 Reciprocal 节点本身改成 Rsqrt，
+                // 输入换成 x。输出 value 不变（使用者无感），Sqrt 变孤儿交给 DCE
+                graph.storage.set_node_inputs(recip_node, &[sqrt_input]);
+                graph.storage.node_hdr[recip_node as usize].op_tag = OpKind::Rsqrt as u8;
                 applied += 1;
             }
             FloatOpt::SoftmaxOnline { .. } => {
@@ -360,11 +414,7 @@ mod tests {
         let rsqrt_def = g.value(rsqrt_out).unwrap().def_node();
         let rsqrt_node = g.node(rsqrt_def).unwrap();
         assert_eq!(rsqrt_node.kind, OpKind::Rsqrt, "应新建 Rsqrt 节点");
-        assert_eq!(
-            rsqrt_node.inputs(),
-            &[b],
-            "Rsqrt 输入应为原 Sqrt 的输入 b"
-        );
+        assert_eq!(rsqrt_node.inputs(), &[b], "Rsqrt 输入应为原 Sqrt 的输入 b");
     }
 
     /// `2.0 / sqrt(x)`（分子常量≠1）→ `Mul(2.0, Rsqrt(x))`，不折叠常量
@@ -480,5 +530,49 @@ mod tests {
         // x/1 不应触发 DivByConstToMul（c=1 跳过，留给 algebra 的 x/1=x）
         let count = apply_float_opts(&mut g).unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// `Reciprocal(Sqrt(x))` → `Rsqrt(x)`（2 op 降 1 op）：Reciprocal 节点本身改 Rsqrt
+    #[test]
+    fn reciprocal_sqrt_becomes_rsqrt() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let sqrt_out = g.add_value(Type::Scalar(DType::F32), Some("sx"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[x]);
+        g.storage.set_node_outputs(sqrt, &[sqrt_out]);
+        let recip = g.add_node(OpKind::Reciprocal);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), recip);
+        g.storage.set_node_inputs(recip, &[sqrt_out]);
+        g.storage.set_node_outputs(recip, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // Reciprocal 节点应已变成 Rsqrt，输入换成 [x]
+        let n = g.node(recip).unwrap();
+        assert_eq!(n.kind, OpKind::Rsqrt, "Reciprocal(Sqrt(x)) 应改成 Rsqrt");
+        assert_eq!(n.inputs(), &[x], "Rsqrt 输入应为原 Sqrt 的输入 x");
+        assert_eq!(n.outputs(), &[out]);
+    }
+
+    /// `Reciprocal(x)`（输入非 Sqrt）不应触发 ReciprocalSqrt
+    #[test]
+    fn reciprocal_non_sqrt_not_matched() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let recip = g.add_node(OpKind::Reciprocal);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), recip);
+        g.storage.set_node_inputs(recip, &[x]);
+        g.storage.set_node_outputs(recip, &[out]);
+        g.mark_output(out);
+
+        let opts = find_opportunities(&g).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, FloatOpt::ReciprocalSqrt { .. })),
+            "Reciprocal(x) 输入非 Sqrt 不应触发 ReciprocalSqrt"
+        );
     }
 }

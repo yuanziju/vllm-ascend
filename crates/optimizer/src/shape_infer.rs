@@ -63,6 +63,7 @@ fn infer_shape(graph: &Graph, node_id: NodeId) -> Result<Option<Vec<i64>>> {
         | OpKind::Tanh
         | OpKind::Sqrt
         | OpKind::Rsqrt
+        | OpKind::Reciprocal
         | OpKind::Exp => {
             if ins.is_empty() {
                 return Ok(None);
