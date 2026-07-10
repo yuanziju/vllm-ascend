@@ -68,6 +68,9 @@ pub fn default_rules() -> Vec<Rule> {
         r#"(rule (when (= op "load"))   (emit "load"  "addr"))"#,
         r#"(rule (when (= op "store"))  (emit "store" "addr" "v"))"#,
         r#"(rule (when (= op "const"))  (emit "const" "imm"))"#,
+        // 融合产物（fuse pass 产，attr 记 op 序列）；未知 ONNX 算子（frontend 产）
+        r#"(rule (when (= op "fused"))  (emit "fused" "x"))"#,
+        r#"(rule (when (= op "custom")) (emit "custom" "x"))"#,
     ];
     srcs.iter().map(|s| parse_rule(s).unwrap()).collect()
 }

@@ -92,6 +92,9 @@ pub fn estimate_op(graph: &Graph, node: NodeView) -> Result<OpCost> {
         // Reduce 类：读全部输入元素，flops 与输入量成正比（sum/max 简单累加）
         OpKind::ReduceSum | OpKind::ReduceMean | OpKind::ReduceMax => (in_bytes / 4.0 * 2.0, 1.0),
         OpKind::Constant | OpKind::Placeholder | OpKind::Return => (0.0, 0.0),
+        // Fused：融合后单节点，FLOPs/launch 已按链累加在 fusion_saving 里扣减，
+        // 此处给保守估值（按 out_bytes 量级，不算额外 launch——融合省的就是 launch）
+        OpKind::Fused => (out_bytes / 4.0, 0.0),
         _ => (out_bytes / 4.0, 1.0),
     };
 

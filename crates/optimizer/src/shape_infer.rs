@@ -73,6 +73,19 @@ fn infer_shape(graph: &Graph, node_id: NodeId) -> Result<Option<Vec<i64>>> {
             }
             s
         }
+        // Fused：融合后输出 shape = 链尾原输出 shape。链尾是 elementwise 时 shape
+        // 不变（= 首输入 shape）；链头是 reduce 时 shape 改变——保守取链尾原输出
+        // 已知 shape（若有），否则不推。这里取首输入 shape 作 elementwise 保守估计
+        OpKind::Fused => {
+            if ins.is_empty() {
+                return Ok(None);
+            }
+            let s = graph.value(ins[0])?.shape().to_vec();
+            if s.is_empty() || !shape_known(&s) {
+                return Ok(None);
+            }
+            s
+        }
         // 双输入 elementwise：广播（要求两个输入 shape 都已知，否则保守不推，
         // 避免用未知输入推出错误 shape 然后被锁定）
         OpKind::Add | OpKind::Sub | OpKind::Mul | OpKind::Div | OpKind::Pow => {

@@ -229,15 +229,15 @@ mod tests {
     /// lowering 发 "rsqrt" kernel、isel 选 "rsqrt" 指令。证明 IEEE754 浮点结构
     /// 优化在全 pipeline 生效，新 Rsqrt op 不报"未覆盖"。
     ///
-    /// 注：用 O1 而非 O2——O2 的 fusion 会产 Custom 节点，而 lowering 尚未覆盖
-    /// Custom（Custom 还被未知 ONNX 算子复用，需单独轮次区分），与本轮 Rsqrt 无关。
+    /// 跑完整 O2 pipeline（含 fusion）：fusion 产 Fused 节点（非 Custom），
+    /// lowering 已覆盖 Fused → "fused" kernel、isel 选 "fused" 指令，不崩。
     #[test]
     fn layernorm_decompose_then_fast_inv_sqrt_fuses_to_rsqrt() {
         let bytes = build_layernorm_onnx(1e-3);
         let mut graph = frontend::parse_onnx(&bytes).unwrap();
-        // 跑优化 pipeline（decompose → shape_infer → constprop → algebra →
-        // constprop → float_opts → cse → dce）。O1 不跑 fusion，避开 Custom lowering 缺口
-        let mut pm = optimizer::PassManager::default_for(OptLevel::O1, Target::Cuda);
+        // 跑完整优化 pipeline O2（decompose → ... → float_opts → cse → dce →
+        // fusion → dce）。fusion 产 Fused 节点，lowering 已覆盖不崩
+        let mut pm = optimizer::PassManager::default_for(OptLevel::O2, Target::Cuda);
         pm.run(&mut graph).unwrap();
 
         // float_opts 应把 decompose 产生的 Div(1,Sqrt) 融合成 Rsqrt
@@ -249,10 +249,19 @@ mod tests {
             "LayerNorm 经 decompose + float_opts 后应出现 Rsqrt 节点（1/sqrt 融合）"
         );
 
-        // Rsqrt 全链路通：lowering 不报"未覆盖"，isel 能选指令
+        // 全链路通：lowering 不报"未覆盖"（Fused + Rsqrt + 各原语都覆盖），isel 能选指令
         let arch_graph = arch::lower(&graph, Target::Cuda).unwrap();
         let instrs = isel::select(&arch_graph).unwrap();
         let has_rsqrt_instr = instrs.iter().any(|i| i.op == "rsqrt");
         assert!(has_rsqrt_instr, "isel 应为 Rsqrt 选出 'rsqrt' 指令");
+        // 若 fusion 产生了 Fused 节点，应选出 "fused" 指令（不崩在 lowering）
+        let has_fused_instr = instrs.iter().any(|i| i.op == "fused");
+        let has_fused_node = graph
+            .node_ids()
+            .any(|id| graph.node(id).map(|n| n.kind == base::OpKind::Fused).unwrap_or(false));
+        assert_eq!(
+            has_fused_instr, has_fused_node,
+            "Fused 节点与 'fused' 指令应一致出现"
+        );
     }
 }
