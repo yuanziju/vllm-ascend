@@ -18,6 +18,10 @@
 //! - **ExpDivFusion 重排**：`Exp(x) / Exp(y)` → `Exp(x - y)`（省一个 Exp）。
 //!   恒等式 `e^x/e^y = e^(x-y)`，幂除法法则，ExpMulFusion 的对偶。attention 里
 //!   attention score 归一化（exp(score)/sum(exp)）常见此模式。
+//! - **PowHalfToSqrt**：`Pow(x, 0.5)` → `Sqrt(x)` / `Pow(x, -0.5)` → `Rsqrt(x)`。
+//!   把通用 Pow（log/exp 实现的超越函数，贵）换成专用单条硬件指令（IEEE754 sqrt/rsqrt，
+//!   rsqrt 可用 0x5f3759df bit trick）。幂指数 ±0.5 时 x^0.5=√x，x^(-0.5)=1/√x。
+//!   RMSNorm 的 `x * Pow(var+eps, -0.5)` 常见此模式
 //! - **DivByConstToMul**：`x / c` → `x * (1/c)`。除法 latency 远高于乘法，
 //!   预计算倒数转成乘法。注意：对 c=0 不做；浮点倒数有精度损失但可接受。
 //! - **MulByTwoToAdd**：`x * 2.0` → `x + x`。乘以 2 的幂可用 IEEE754 位级
@@ -80,6 +84,16 @@ pub enum FloatOpt {
         x_input: ValueId,
         y_input: ValueId,
     },
+    /// `Pow(x, 0.5)` → `Sqrt(x)` / `Pow(x, -0.5)` → `Rsqrt(x)`。
+    /// 把通用 Pow（用 log/exp 实现的超越函数，贵）换成专用单条硬件指令
+    /// （IEEE754 sqrt/rsqrt，rsqrt 可用 0x5f3759df bit trick）。幂指数为 ±0.5 时
+    /// x^0.5=√x，x^(-0.5)=1/√x=rsqrt(x)。RMSNorm 的 `x * Pow(var+eps, -0.5)` 常见此模式
+    PowHalfToSqrt {
+        pow_node: base::NodeId,
+        base: ValueId,
+        /// true=指数 -0.5（→Rsqrt）；false=指数 0.5（→Sqrt）
+        is_negative: bool,
+    },
 }
 
 pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
@@ -114,6 +128,11 @@ pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
             }
             OpKind::Reciprocal => {
                 if let Some(opt) = try_match_reciprocal_sqrt(graph, n)? {
+                    opts.push(opt);
+                }
+            }
+            OpKind::Pow => {
+                if let Some(opt) = try_match_pow_half(graph, n)? {
                     opts.push(opt);
                 }
             }
@@ -321,6 +340,30 @@ fn try_match_div_by_const(graph: &Graph, div: NodeView) -> Result<Option<FloatOp
     Ok(None)
 }
 
+/// 识别 `Pow(x, 0.5)` / `Pow(x, -0.5)`：Pow 节点，指数输入(ins[1])是常量 ±0.5。
+/// x^0.5=√x，x^(-0.5)=1/√x=rsqrt(x)。把通用 Pow 换成专用 sqrt/rsqrt 硬件指令。
+/// 注意：只匹配指数是 ±0.5 常量（底数任意）。底数是常量时 algebra 的常量折叠已处理
+fn try_match_pow_half(graph: &Graph, pow: NodeView) -> Result<Option<FloatOpt>> {
+    let ins = pow.inputs();
+    if ins.len() != 2 {
+        return Ok(None);
+    }
+    let (base, exp) = (ins[0], ins[1]);
+    match constant_value(graph, exp)? {
+        Some(0.5) => Ok(Some(FloatOpt::PowHalfToSqrt {
+            pow_node: pow.id,
+            base,
+            is_negative: false,
+        })),
+        Some(-0.5) => Ok(Some(FloatOpt::PowHalfToSqrt {
+            pow_node: pow.id,
+            base,
+            is_negative: true,
+        })),
+        _ => Ok(None),
+    }
+}
+
 fn constant_value(graph: &Graph, v: ValueId) -> Result<Option<f64>> {
     let val = graph.value(v)?;
     let def = val.def_node();
@@ -505,6 +548,22 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
             }
             FloatOpt::SoftmaxOnline { .. } => {
                 // 仅识别，不改图（online-softmax 是 kernel tiling 策略，非 IR 重写）
+            }
+            FloatOpt::PowHalfToSqrt {
+                pow_node,
+                base,
+                is_negative,
+            } => {
+                // Pow(x, 0.5) → Sqrt(x) / Pow(x, -0.5) → Rsqrt(x)：
+                // 把 Pow 节点 op 改成 Sqrt/Rsqrt，输入换成 [x]（丢弃常量指数）。
+                // 输出 value 不变（使用者无感），常量指数变孤儿交给 DCE
+                graph.storage.set_node_inputs(pow_node, &[base]);
+                graph.storage.node_hdr[pow_node as usize].op_tag = if is_negative {
+                    OpKind::Rsqrt as u8
+                } else {
+                    OpKind::Sqrt as u8
+                };
+                applied += 1;
             }
         }
     }
@@ -950,5 +1009,89 @@ mod tests {
             "复用的 exp_x 输入应是 Sub 输出"
         );
         assert!(g.outputs().contains(&ex_out), "图输出应重写到 exp_x 的输出");
+    }
+
+    /// `Pow(x, 0.5)` → `Sqrt(x)`：Pow 节点本身改 Sqrt，输入换成 [x]
+    #[test]
+    fn pow_half_becomes_sqrt() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, half) = g.add_constant_f64(0.5);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, half]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let n = g.node(pow).unwrap();
+        assert_eq!(n.kind, OpKind::Sqrt, "Pow(x,0.5) 应改成 Sqrt");
+        assert_eq!(n.inputs(), &[x], "Sqrt 输入应为 [x]");
+        assert_eq!(n.outputs(), &[out]);
+    }
+
+    /// `Pow(x, -0.5)` → `Rsqrt(x)`：Pow 节点本身改 Rsqrt，输入换成 [x]
+    #[test]
+    fn pow_neg_half_becomes_rsqrt() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, neg_half) = g.add_constant_f64(-0.5);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, neg_half]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let n = g.node(pow).unwrap();
+        assert_eq!(n.kind, OpKind::Rsqrt, "Pow(x,-0.5) 应改成 Rsqrt");
+        assert_eq!(n.inputs(), &[x], "Rsqrt 输入应为 [x]");
+        assert_eq!(n.outputs(), &[out]);
+    }
+
+    /// `Pow(x, 2.0)`（指数非 ±0.5）不应触发 PowHalfToSqrt
+    #[test]
+    fn pow_non_half_not_matched() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, two) = g.add_constant_f64(2.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, two]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let opts = find_opportunities(&g).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, FloatOpt::PowHalfToSqrt { .. })),
+            "Pow(x,2.0) 不应触发 PowHalfToSqrt"
+        );
+    }
+
+    /// `Pow(x, 0.5)` 张量模式：shape 正确传递（输出 value 不变）
+    #[test]
+    fn pow_half_tensor_preserves_shape() {
+        let mut g = Graph::new("test");
+        let ty = Type::Tensor {
+            dtype: DType::F32,
+            dims: vec![2, 3],
+        };
+        let x = g.add_input(ty.clone(), Some("x"));
+        let (_c, half) = g.add_constant_f64(0.5);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(ty.clone(), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, half]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let n = g.node(pow).unwrap();
+        assert_eq!(n.kind, OpKind::Sqrt);
+        assert_eq!(n.inputs(), &[x]);
     }
 }
