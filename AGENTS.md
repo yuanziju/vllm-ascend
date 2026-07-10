@@ -299,3 +299,35 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 3. algebra 常量传播跨节点（constprop 当前只做 value canonicalize）
 4. fuse 可扩展：reduce + elementwise 更复杂模式（当前 binary side inputs 已支持）
 5. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）
+
+### 2026-07-10 — FastInvSqrt 真正图重写 + Rsqrt op（feat/neutron-7b3e9c41）
+
+**当前状态**：float_opts 的 FastInvSqrt 从"识别不改图"空壳做成真正的浮点结构图重写，新增 Rsqrt op 全链路打通。回归全绿。本分支待合并回 main。
+
+**用户指引**：本轮起用户明确——不要在简单代数规则（x+0/x*1 那类）和常量传播上花时间，这些在真实 ML 算子计算里基本不出现；当前多数 pass 还是基于规则的简单匹配，价值有限。应聚焦设计哲学点名的"浮点结构优化（IEEE754 位级 trick / Flash Attention online-softmax 式重排）"——这才是项目招牌。故本轮选 FastInvSqrt（之前是空壳）动手。
+
+**已完成**（2 commit，按时序）：
+- **base 加 Rsqrt op(=26) + 全链路接入**（commit e63b1fa）：`OpKind::Rsqrt=26` + from_u8。shape_infer 加 Rsqrt 到 unary elementwise passthrough；cost_model 估算 out_bytes/4*2（比 Sqrt+Div 便宜）；lowering `Rsqrt → "rsqrt"`；isel 加 `(when (= op "rsqrt"))` 规则。新 op 必须四点全接，否则 lowering 报"未覆盖"
+- **float_opts FastInvSqrt 真正重写**（commit f7a0cc1）：核心是浮点恒等式 `a/√b = a·b^(-1/2)`。`Div(a, Sqrt(b))` → a==1.0 常量时直接 `Rsqrt(b)`（2 op 降 1 op，Div 节点本身改 Rsqrt，输入换 b）；a 非常量时 `Mul(a, Rsqrt(b))`（新建 Rsqrt 节点吃 b，Div 改 Mul）。Sqrt+Div（含一个贵的 Div）融成 Rsqrt（单条硬件指令 / 0x5f3759df 魔数 bit trick，Quake III fast inverse sqrt）+ 便宜 Mul。RMSNorm/LayerNorm 等 normalization 到处出现。FloatOpt::FastInvSqrt enum 补 numerator/sqrt_input/numerator_is_one 字段；try_match 改为匹配**除数**是 Sqrt（分子任意，注意 `sqrt(x)/a` ≠ `a·rsqrt(x)` 不匹配）。SoftmaxOnline 明确留作 recognition——真正 FA 融合（softmax+matmul）是设计哲学禁止的贪心模式，online-softmax 本质是 kernel tiling 策略非 IR 重写。fuse is_elementwise 加注释说明 Rsqrt 故意不列入（保留为独立 op 让 lowering 发专用 rsqrt kernel，而非被融进链变 Custom）
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：112 passed（base 3 + common 2 + frontend 23 + interface 3 + isel 12 + lisp 4 + optimizer 65）—— 较上轮 106 +6（5 新 float_opts 单测 + 1 e2e）
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
+
+**e2e 验证**（interface）：构造 LayerNormalization(x,gamma,beta,epsilon=1e-3) 的 ONNX，跑完整优化 pipeline（O1），验证 decompose 产生的 `Div(1,Sqrt(var+ε))` 被 float_opts 融合成 Rsqrt，且 Rsqrt 全链路通——lowering 发 "rsqrt" kernel、isel 选 "rsqrt" 指令。证明 IEEE754 浮点结构优化在全 pipeline 生效。
+
+**⚠️ 发现的 critical 缺口（未修，下轮优先）**：O2 的 fusion 会把 elementwise 链融成 `Custom` 节点，但 lowering **未覆盖 Custom**（`other => Err`），导致任何非空图跑 O2 都会在 lowering 崩。之前几轮"CLI e2e 正常"只测了 empty.onnx（无算子无融合），从未暴露。更麻烦：`Custom` 被**复用**于两种语义——fusion 融合结果 vs 未知 ONNX 算子（frontend 把未知 op_type 映射 Custom + attr 记原始 op_type 字符码），两者 lowering 语义不同。修复需区分（建议新增 `Fused` op 专管融合结果，Custom 留给未知算子），是单独一轮的活。本轮 e2e 测试用 O1 避开此缺口。
+
+**设计哲学遵守**：FastInvSqrt 是浮点代数恒等式（`a/√b=a·b^(-1/2)`）的结构融合，不是 MatMul+Add→Linear 贪心模式；针对 IEEE754 浮点本身结构（rsqrt 有专用硬件指令/位 trick），正是设计哲学点名"类 Quake III fast inverse sqrt"。SoftmaxOnline 不做成重写是经过论证的——真 FA 融合是禁止的贪心模式。
+
+**新增长效机制**：本轮起建立 [WORKFLOW.md](WORKFLOW.md)（新 agent 上手标准 checklist：验证回归→建分支→频繁提交→写遗言→合并），AGENTS.md 顶部已加引用。本环境会话窗口不稳定（挂过多次），对策是频繁提交 + 中途写遗言。
+
+**下一步**（优先级排序）：
+1. **修 fusion→Custom→lowering 缺口**（critical，阻塞 O2 真实模型）：新增 `Fused` op 专管融合结果（Custom 留给未知算子），lowering 发 "fused" kernel，isel 加规则；或让 lowering 读 Custom attr 区分。修完后 e2e 测试可升回 O2
+2. pt 前端：PyTorch 解析（frontend 最后一块占位）
+3. float_opts 可继续：`Reciprocal(Sqrt(x))` 模式（ONNX Reciprocal op）也映射 Rsqrt；识别 `x * rsqrt(y)` 的 RMSNorm 整体模式做 cost-based 决策
+4. isel：更多目标后端规则覆盖
+5. fuse 可扩展：reduce + elementwise 更复杂模式
