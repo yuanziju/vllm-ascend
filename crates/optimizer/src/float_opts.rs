@@ -22,6 +22,8 @@
 //!   把通用 Pow（log/exp 实现的超越函数，贵）换成专用单条硬件指令（IEEE754 sqrt/rsqrt，
 //!   rsqrt 可用 0x5f3759df bit trick）。幂指数 ±0.5 时 x^0.5=√x，x^(-0.5)=1/√x。
 //!   RMSNorm 的 `x * Pow(var+eps, -0.5)` 常见此模式
+//! - **PowNegOneToReciprocal**：`Pow(x, -1.0)` → `Reciprocal(x)`。x^(-1)=1/x，
+//!   同 PowHalfToSqrt 一类：通用幂 → 专用 op（单条硬件指令）
 //! - **DivByConstToMul**：`x / c` → `x * (1/c)`。除法 latency 远高于乘法，
 //!   预计算倒数转成乘法。注意：对 c=0 不做；浮点倒数有精度损失但可接受。
 //! - **MulByTwoToAdd**：`x * 2.0` → `x + x`。乘以 2 的幂可用 IEEE754 位级
@@ -93,6 +95,12 @@ pub enum FloatOpt {
         base: ValueId,
         /// true=指数 -0.5（→Rsqrt）；false=指数 0.5（→Sqrt）
         is_negative: bool,
+    },
+    /// `Pow(x, -1.0)` → `Reciprocal(x)`。x^(-1)=1/x，把通用 Pow 换成专用 Reciprocal
+    /// （单条硬件指令 / 0x5f3759df 同族 bit trick）。同 PowHalfToSqrt 一类：通用幂 → 专用 op
+    PowNegOneToReciprocal {
+        pow_node: base::NodeId,
+        base: ValueId,
     },
 }
 
@@ -360,6 +368,10 @@ fn try_match_pow_half(graph: &Graph, pow: NodeView) -> Result<Option<FloatOpt>> 
             base,
             is_negative: true,
         })),
+        Some(-1.0) => Ok(Some(FloatOpt::PowNegOneToReciprocal {
+            pow_node: pow.id,
+            base,
+        })),
         _ => Ok(None),
     }
 }
@@ -563,6 +575,13 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                 } else {
                     OpKind::Sqrt as u8
                 };
+                applied += 1;
+            }
+            FloatOpt::PowNegOneToReciprocal { pow_node, base } => {
+                // Pow(x, -1.0) → Reciprocal(x)：把 Pow 节点 op 改成 Reciprocal，
+                // 输入换成 [x]（丢弃常量指数）。x^(-1)=1/x=reciprocal(x)
+                graph.storage.set_node_inputs(pow_node, &[base]);
+                graph.storage.node_hdr[pow_node as usize].op_tag = OpKind::Reciprocal as u8;
                 applied += 1;
             }
         }
@@ -1093,5 +1112,25 @@ mod tests {
         let n = g.node(pow).unwrap();
         assert_eq!(n.kind, OpKind::Sqrt);
         assert_eq!(n.inputs(), &[x]);
+    }
+
+    /// `Pow(x, -1.0)` → `Reciprocal(x)`：Pow 节点本身改 Reciprocal，输入换成 [x]
+    #[test]
+    fn pow_neg_one_becomes_reciprocal() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, neg_one) = g.add_constant_f64(-1.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, neg_one]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let n = g.node(pow).unwrap();
+        assert_eq!(n.kind, OpKind::Reciprocal, "Pow(x,-1) 应改成 Reciprocal");
+        assert_eq!(n.inputs(), &[x], "Reciprocal 输入应为 [x]");
+        assert_eq!(n.outputs(), &[out]);
     }
 }
