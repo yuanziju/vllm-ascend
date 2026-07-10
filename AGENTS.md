@@ -331,3 +331,38 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 3. float_opts 可继续：`Reciprocal(Sqrt(x))` 模式（ONNX Reciprocal op）也映射 Rsqrt；识别 `x * rsqrt(y)` 的 RMSNorm 整体模式做 cost-based 决策
 4. isel：更多目标后端规则覆盖
 5. fuse 可扩展：reduce + elementwise 更复杂模式
+
+### 2026-07-10 — Fused op 修 O2 缺口 + 5 个浮点结构重写（feat/neutron-9c2e1a7b）
+
+**当前状态**：本轮为首个 30 分钟时间盒任务（WORKSPEC.md 规则），从 22:38 做到 22:53。修了上轮发现的 fusion→Custom→lowering critical 缺口（O2 不再崩），并把 float_opts 从 2 个简单规则扩到 7 个浮点结构重写。回归全绿，本分支待合并回 main。
+
+**用户指引延续**：不在简单代数/常量传播上花时间，聚焦浮点结构优化。本轮 float_opts 新增的 5 个全是浮点代数恒等式重排，非贪心模式。
+
+**已完成**（7 commit，按时序）：
+- **base 加 Fused op(=27) 修 fusion→Custom→lowering critical 缺口**（commit cc060ec）：上轮发现 O2 fusion 产 Custom 但 lowering 未覆盖 Custom（Custom 还被未知 ONNX 算子复用），任何非空图跑 O2 都崩。新增 `Fused` op 专管融合产物，Custom 留给未知算子。fuse apply_fusion 链尾 op_tag Custom→Fused（doc/注释/5 单测断言同步）；lowering Fused→"fused" kernel、Custom→"custom" kernel（原 other→Err 改显式分支）；isel 加 (when fused/custom) 规则；cost_model Fused 估值 launch=0；shape_infer Fused 取首输入 shape；interface e2e 升回 O2 全链路通
+- **float_opts ReciprocalSqrt**（commit 94c6d4f）：`Reciprocal(Sqrt(x))` → `Rsqrt(x)`（2 op 降 1 op），同 1/√x 恒等式。ONNX Reciprocal(Sqrt) 是 RMSNorm 常见写法。base 加 Reciprocal op(=28) + frontend 映射 + 全链路接入 + 2 单测
+- **float_opts DivByReciprocal**（commit a7c4c65）：`a / Reciprocal(b)` → `Mul(a, b)`（消去 Reciprocal+Div 换便宜 Mul），a/(1/b)=a·b。2 单测
+- **interface e2e Reciprocal(Sqrt)→Rsqrt**（commit c60a0a1）：用 base API 构图跑 O2 pipeline 验证 ReciprocalSqrt 全链路（lowering rsqrt kernel、isel rsqrt 指令）
+- **float_opts ExpMulFusion**（commit 1bd2907）：`Exp(x)*Exp(y)` → `Exp(Add(x,y))`（省一个 Exp），e^x·e^y=e^(x+y)。softmax/attention exp 链相乘极常见。新建 Add 吃 [x,y]，复用 exp_x 改吃 Add 输出，Mul 输出使用者重写到 exp_x 输出。1 单测 + 修 3 处 clippy manual_contains
+- **float_opts ExpDivFusion**（commit fdfa275）：`Exp(x)/Exp(y)` → `Exp(Sub(x,y))`（省一个 Exp），e^x/e^y=e^(x-y)，ExpMulFusion 对偶。attention score 归一化常见。1 单测
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：119 passed（base 3 + common 2 + frontend 23 + interface 4 + isel 12 + lisp 4 + optimizer 71）—— 较上轮 112 +7（6 新 float_opts + 1 e2e）
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
+
+**设计哲学遵守**：
+- Fused vs Custom 分离是"让 lowering 按 op_kind 直接分派不靠 attr 探测猜语义"的正确性修复，非贪心模式
+- 5 个新浮点重写全是浮点代数恒等式：1/√x=x^(-1/2)、a/(1/b)=a·b、e^x·e^y=e^(x+y)、e^x/e^y=e^(x-y)。是设计哲学点名"IEEE754 位级 trick / Flash Attention online-softmax 式重排"的具体落地，非 MatMul+Add→Linear 贪心模式
+- Reciprocal(Sqrt) 和 Div(1,Sqrt) 是同一 1/√x 恒等式的两种 ONNX 写法，都映射 Rsqrt——前向覆盖两种 frontend 输入形态
+
+**新增长效机制**：本轮首次执行 [WORKSPEC.md](WORKSPEC.md) 时间盒规则——22:38 开工计时北京时间，持续列待办+完成待办+子代理并行（用了 2 个 search 子代理摸清 fuse/frontend 的 Custom 结构），到点收尾。用户确认 WORKSPEC 定稿。
+
+**下一步**（优先级排序）：
+1. isel：补 Reciprocal/Rsqrt/Fused/Custom 规则覆盖检查（本轮已加规则但未做覆盖审计）
+2. pt 前端：PyTorch 解析（frontend 最后一块占位）
+3. float_opts 可继续：识别 `x * rsqrt(y)` 的 RMSNorm 整体模式做 cost-based 决策；`Sqrt(x*x)` → `Abs(x)`；`Log(Exp(x))` → `x`
+4. fuse 可扩展：reduce + elementwise 更复杂模式
+5. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型
