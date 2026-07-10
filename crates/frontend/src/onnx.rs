@@ -14,7 +14,7 @@
 //! - NodeProto: 1=input(repeated string), 2=output(repeated string), 3=op_type(string),
 //!   4=name(string), 5=attribute(repeated), 7=domain(string)
 
-use base::RawAttrKey;
+use base::StorageAttrKey;
 use base::{DType, Graph, OpKind, Result, Type};
 
 use crate::proto::{read_string_field, Cursor};
@@ -66,7 +66,8 @@ pub fn parse(bytes: &[u8]) -> Result<Graph> {
         // 未知 op_type 记录到 attr（Custom 槽位用 Shape int array 存字符 code 点）
         if matches!(kind, OpKind::Custom) {
             let codes: Vec<i64> = node.op_type.chars().map(|c| c as i64).collect();
-            g.raw.add_attr_int_array(nid, RawAttrKey::Shape, &codes);
+            g.storage
+                .add_attr_int_array(nid, StorageAttrKey::Shape, &codes);
         }
         // outputs：先创建 value（这样 inputs 可以前向引用后续节点输出）
         for out_name in &node.outputs {
@@ -80,7 +81,7 @@ pub fn parse(bytes: &[u8]) -> Result<Graph> {
             );
             registry.register(out_name.clone(), v);
         }
-        g.raw.set_node_outputs(
+        g.storage.set_node_outputs(
             nid,
             &node
                 .outputs
@@ -98,7 +99,7 @@ pub fn parse(bytes: &[u8]) -> Result<Graph> {
             .iter()
             .map(|n| registry.get(n).unwrap_or(u32::MAX))
             .collect();
-        g.raw.set_node_inputs(nid, &inputs);
+        g.storage.set_node_inputs(nid, &inputs);
     }
 
     // 图输出（GraphProto.output，field 12）

@@ -137,8 +137,8 @@ fn infer_shape(graph: &Graph, node_id: NodeId) -> Result<Option<Vec<i64>>> {
 fn read_axis(graph: &Graph, node_id: NodeId) -> Result<i64> {
     let n = graph.node(node_id)?;
     for e in n.attrs() {
-        if e.key == base::RawAttrKey::Axis as u8 && e.tag == base::raw::AttrTag::Int as u8 {
-            return Ok(n.raw.attr_int(e));
+        if e.key == base::StorageAttrKey::Axis as u8 && e.tag == base::storage::AttrTag::Int as u8 {
+            return Ok(n.storage.attr_int(e));
         }
     }
     Ok(-1)
@@ -173,7 +173,7 @@ pub fn apply_shape_infer(graph: &mut Graph) -> Result<usize> {
         }
         // 第二阶段：应用回填（可变借用安全）
         for (out_v, new_shape) in to_fill {
-            graph.raw.set_value_shape(out_v, &new_shape);
+            graph.storage.set_value_shape(out_v, &new_shape);
             filled += 1;
             changed = true;
         }
@@ -185,7 +185,7 @@ pub fn apply_shape_infer(graph: &mut Graph) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base::{DType, Graph, OpKind, RawAttrKey, Type};
+    use base::{DType, Graph, OpKind, StorageAttrKey, Type};
 
     fn tensor(dims: Vec<i64>) -> Type {
         Type::Tensor {
@@ -200,8 +200,8 @@ mod tests {
         let x = g.add_input(tensor(vec![2, 3]), Some("x"));
         let relu = g.add_node(OpKind::Relu);
         let out = g.add_value(tensor(vec![-1, -1]), Some("o"), relu); // 未知 shape
-        g.raw.set_node_inputs(relu, &[x]);
-        g.raw.set_node_outputs(relu, &[out]);
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[out]);
         g.mark_output(out);
 
         let n = apply_shape_infer(&mut g).unwrap();
@@ -217,8 +217,8 @@ mod tests {
         let b = g.add_input(tensor(vec![1, 3]), Some("b"));
         let add = g.add_node(OpKind::Add);
         let out = g.add_value(tensor(vec![-1, -1]), Some("o"), add);
-        g.raw.set_node_inputs(add, &[a, b]);
-        g.raw.set_node_outputs(add, &[out]);
+        g.storage.set_node_inputs(add, &[a, b]);
+        g.storage.set_node_outputs(add, &[out]);
         g.mark_output(out);
 
         apply_shape_infer(&mut g).unwrap();
@@ -232,9 +232,9 @@ mod tests {
         let x = g.add_input(tensor(vec![2, 3, 4]), Some("x"));
         let rs = g.add_node(OpKind::ReduceSum);
         let out = g.add_value(tensor(vec![-1, -1]), Some("o"), rs);
-        g.raw.set_node_inputs(rs, &[x]);
-        g.raw.set_node_outputs(rs, &[out]);
-        g.raw.add_attr_int(rs, RawAttrKey::Axis, 1);
+        g.storage.set_node_inputs(rs, &[x]);
+        g.storage.set_node_outputs(rs, &[out]);
+        g.storage.add_attr_int(rs, StorageAttrKey::Axis, 1);
         g.mark_output(out);
 
         apply_shape_infer(&mut g).unwrap();
@@ -249,8 +249,8 @@ mod tests {
         let b = g.add_input(tensor(vec![8, 16]), Some("b"));
         let mm = g.add_node(OpKind::MatMul);
         let out = g.add_value(tensor(vec![-1, -1]), Some("o"), mm);
-        g.raw.set_node_inputs(mm, &[a, b]);
-        g.raw.set_node_outputs(mm, &[out]);
+        g.storage.set_node_inputs(mm, &[a, b]);
+        g.storage.set_node_outputs(mm, &[out]);
         g.mark_output(out);
 
         apply_shape_infer(&mut g).unwrap();
@@ -265,8 +265,8 @@ mod tests {
         let x = g.add_input(tensor(vec![2, 3]), Some("x"));
         let relu = g.add_node(OpKind::Relu);
         let out = g.add_value(tensor(vec![9, 9]), Some("o"), relu); // 已知但故意写错
-        g.raw.set_node_inputs(relu, &[x]);
-        g.raw.set_node_outputs(relu, &[out]);
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[out]);
         g.mark_output(out);
 
         apply_shape_infer(&mut g).unwrap();
@@ -282,12 +282,12 @@ mod tests {
         let b = g.add_input(tensor(vec![1, 3]), Some("b"));
         let relu = g.add_node(OpKind::Relu);
         let r_out = g.add_value(tensor(vec![-1, -1]), Some("r"), relu);
-        g.raw.set_node_inputs(relu, &[x]);
-        g.raw.set_node_outputs(relu, &[r_out]);
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[r_out]);
         let add = g.add_node(OpKind::Add);
         let a_out = g.add_value(tensor(vec![-1, -1]), Some("a"), add);
-        g.raw.set_node_inputs(add, &[r_out, b]);
-        g.raw.set_node_outputs(add, &[a_out]);
+        g.storage.set_node_inputs(add, &[r_out, b]);
+        g.storage.set_node_outputs(add, &[a_out]);
         g.mark_output(a_out);
 
         let n = apply_shape_infer(&mut g).unwrap();

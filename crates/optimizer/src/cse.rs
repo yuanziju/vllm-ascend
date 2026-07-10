@@ -94,13 +94,13 @@ fn rewrite_inputs(graph: &mut Graph, replacements: &HashMap<ValueId, ValueId>) {
         let old_inputs: Vec<ValueId> = graph.node(nid).unwrap().inputs().to_vec();
         let new_inputs: Vec<ValueId> = old_inputs.iter().map(|&v| lookup(v)).collect();
         if old_inputs != new_inputs {
-            graph.raw.set_node_inputs(nid, &new_inputs);
+            graph.storage.set_node_inputs(nid, &new_inputs);
         }
     }
     let old_outputs: Vec<ValueId> = graph.outputs().to_vec();
     let new_outputs: Vec<ValueId> = old_outputs.iter().map(|&v| lookup(v)).collect();
     if old_outputs != new_outputs {
-        graph.raw.outputs = new_outputs;
+        graph.storage.outputs = new_outputs;
     }
 }
 
@@ -135,8 +135,8 @@ mod tests {
             Some("c"),
             add1,
         );
-        g.raw.set_node_inputs(add1, &[a, b]);
-        g.raw.set_node_outputs(add1, &[out1]);
+        g.storage.set_node_inputs(add1, &[a, b]);
+        g.storage.set_node_outputs(add1, &[out1]);
         let add2 = g.add_node(OpKind::Add);
         let out2 = g.add_value(
             Type::Tensor {
@@ -146,8 +146,8 @@ mod tests {
             Some("d"),
             add2,
         );
-        g.raw.set_node_inputs(add2, &[a, b]);
-        g.raw.set_node_outputs(add2, &[out2]);
+        g.storage.set_node_inputs(add2, &[a, b]);
+        g.storage.set_node_outputs(add2, &[out2]);
         g.mark_output(out1);
         g.mark_output(out2);
         let result = run_cse(&g).unwrap();
@@ -164,12 +164,12 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let add1 = g.add_node(OpKind::Add);
         let out1 = g.add_value(Type::Scalar(DType::F32), Some("o1"), add1);
-        g.raw.set_node_inputs(add1, &[x, a]);
-        g.raw.set_node_outputs(add1, &[out1]);
+        g.storage.set_node_inputs(add1, &[x, a]);
+        g.storage.set_node_outputs(add1, &[out1]);
         let add2 = g.add_node(OpKind::Add);
         let out2 = g.add_value(Type::Scalar(DType::F32), Some("o2"), add2);
-        g.raw.set_node_inputs(add2, &[x, b]);
-        g.raw.set_node_outputs(add2, &[out2]);
+        g.storage.set_node_inputs(add2, &[x, b]);
+        g.storage.set_node_outputs(add2, &[out2]);
         g.mark_output(out1);
         g.mark_output(out2);
         // CSE 应识别两个 42.0 常量指纹相同，合并之
@@ -189,13 +189,13 @@ mod tests {
         // a + b
         let add1 = g.add_node(OpKind::Add);
         let out1 = g.add_value(Type::Scalar(DType::F32), Some("o1"), add1);
-        g.raw.set_node_inputs(add1, &[a, b]);
-        g.raw.set_node_outputs(add1, &[out1]);
+        g.storage.set_node_inputs(add1, &[a, b]);
+        g.storage.set_node_outputs(add1, &[out1]);
         // b + a （顺序不同，但可交换，应被 CSE 识别）
         let add2 = g.add_node(OpKind::Add);
         let out2 = g.add_value(Type::Scalar(DType::F32), Some("o2"), add2);
-        g.raw.set_node_inputs(add2, &[b, a]);
-        g.raw.set_node_outputs(add2, &[out2]);
+        g.storage.set_node_inputs(add2, &[b, a]);
+        g.storage.set_node_outputs(add2, &[out2]);
         g.mark_output(out1);
         g.mark_output(out2);
         let result = run_cse(&g).unwrap();
@@ -213,12 +213,12 @@ mod tests {
         let (_c2, b) = g.add_constant_f64(2.0);
         let add1 = g.add_node(OpKind::Add);
         let out1 = g.add_value(Type::Scalar(DType::F32), Some("o1"), add1);
-        g.raw.set_node_inputs(add1, &[a, a]);
-        g.raw.set_node_outputs(add1, &[out1]);
+        g.storage.set_node_inputs(add1, &[a, a]);
+        g.storage.set_node_outputs(add1, &[out1]);
         let add2 = g.add_node(OpKind::Add);
         let out2 = g.add_value(Type::Scalar(DType::F32), Some("o2"), add2);
-        g.raw.set_node_inputs(add2, &[b, b]);
-        g.raw.set_node_outputs(add2, &[out2]);
+        g.storage.set_node_inputs(add2, &[b, b]);
+        g.storage.set_node_outputs(add2, &[out2]);
         g.mark_output(out1);
         g.mark_output(out2);
         // 1.0 和 2.0 指纹不同，不应合并

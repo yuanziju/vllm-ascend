@@ -1,4 +1,4 @@
-//! raw — 底层图存储：连续 packed buffer + unsafe。
+//! storage — 底层图存储：连续 packed buffer + unsafe。
 //!
 //! 设计哲学：上层 [`crate::Graph`] 提供 Safe API，下层用巨量 unsafe 构建
 //! 丑陋但高效的王国。所有节点/值/属性压入连续 buffer，ID 即偏移量，O(1) 访问。
@@ -148,7 +148,7 @@ impl std::fmt::Debug for AttrEntry {
 
 /// 底层 packed 图存储
 #[derive(Default)]
-pub struct RawGraph {
+pub struct StorageGraph {
     pub node_hdr: Vec<NodeHeader>,
     pub value_hdr: Vec<ValueHeader>,
     pub edges: Vec<u32>,
@@ -161,9 +161,9 @@ pub struct RawGraph {
     pub outputs: Vec<u32>,
 }
 
-impl std::fmt::Debug for RawGraph {
+impl std::fmt::Debug for StorageGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RawGraph")
+        f.debug_struct("StorageGraph")
             .field("node_count", &self.node_hdr.len())
             .field("value_count", &self.value_hdr.len())
             .field("edge_count", &self.edges.len())
@@ -174,7 +174,7 @@ impl std::fmt::Debug for RawGraph {
     }
 }
 
-impl RawGraph {
+impl StorageGraph {
     pub fn new() -> Self {
         Self::default()
     }

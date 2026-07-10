@@ -225,13 +225,13 @@ fn rewrite_inputs(graph: &mut Graph, replacements: &HashMap<ValueId, ValueId>) {
         let old_inputs: Vec<ValueId> = graph.node(nid).unwrap().inputs().to_vec();
         let new_inputs: Vec<ValueId> = old_inputs.iter().map(|&v| lookup(v)).collect();
         if old_inputs != new_inputs {
-            graph.raw.set_node_inputs(nid, &new_inputs);
+            graph.storage.set_node_inputs(nid, &new_inputs);
         }
     }
     let old_outputs: Vec<ValueId> = graph.outputs().to_vec();
     let new_outputs: Vec<ValueId> = old_outputs.iter().map(|&v| lookup(v)).collect();
     if old_outputs != new_outputs {
-        graph.raw.outputs = new_outputs;
+        graph.storage.outputs = new_outputs;
     }
 }
 
@@ -259,8 +259,8 @@ mod tests {
             Some("out"),
             add,
         );
-        g.raw.set_node_inputs(add, &[x, zero]);
-        g.raw.set_node_outputs(add, &[out]);
+        g.storage.set_node_inputs(add, &[x, zero]);
+        g.storage.set_node_outputs(add, &[out]);
         g.mark_output(out);
         g
     }
@@ -281,8 +281,8 @@ mod tests {
         let (_c, one) = g.add_constant_f64(1.0);
         let mul = g.add_node(OpKind::Mul);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), mul);
-        g.raw.set_node_inputs(mul, &[x, one]);
-        g.raw.set_node_outputs(mul, &[out]);
+        g.storage.set_node_inputs(mul, &[x, one]);
+        g.storage.set_node_outputs(mul, &[out]);
         g.mark_output(out);
         let count = run_algebraic_simplify(&mut g).unwrap();
         assert_eq!(count, 1);
@@ -296,8 +296,8 @@ mod tests {
         let (_c, zero) = g.add_constant_f64(0.0);
         let mul = g.add_node(OpKind::Mul);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), mul);
-        g.raw.set_node_inputs(mul, &[x, zero]);
-        g.raw.set_node_outputs(mul, &[out]);
+        g.storage.set_node_inputs(mul, &[x, zero]);
+        g.storage.set_node_outputs(mul, &[out]);
         g.mark_output(out);
         let count = run_algebraic_simplify(&mut g).unwrap();
         assert_eq!(count, 1);
@@ -316,8 +316,8 @@ mod tests {
         let (_c2, b) = g.add_constant_f64(4.0);
         let add = g.add_node(OpKind::Add);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), add);
-        g.raw.set_node_inputs(add, &[a, b]);
-        g.raw.set_node_outputs(add, &[out]);
+        g.storage.set_node_inputs(add, &[a, b]);
+        g.storage.set_node_outputs(add, &[out]);
         g.mark_output(out);
         let count = run_algebraic_simplify(&mut g).unwrap();
         assert_eq!(count, 1);
@@ -333,8 +333,8 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let sub = g.add_node(OpKind::Sub);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sub);
-        g.raw.set_node_inputs(sub, &[x, x]);
-        g.raw.set_node_outputs(sub, &[out]);
+        g.storage.set_node_inputs(sub, &[x, x]);
+        g.storage.set_node_outputs(sub, &[out]);
         g.mark_output(out);
         // 默认 unsafe_opts=false，不应简化
         let count = run_algebraic_simplify(&mut g).unwrap();
@@ -347,8 +347,8 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let sub = g.add_node(OpKind::Sub);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sub);
-        g.raw.set_node_inputs(sub, &[x, x]);
-        g.raw.set_node_outputs(sub, &[out]);
+        g.storage.set_node_inputs(sub, &[x, x]);
+        g.storage.set_node_outputs(sub, &[out]);
         g.mark_output(out);
         let count = run_with_config(&mut g, AlgebraConfig { unsafe_opts: true }).unwrap();
         assert_eq!(count, 1);

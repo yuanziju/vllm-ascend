@@ -22,8 +22,8 @@ pub fn parse(src: &str) -> Result<Graph> {
     let mut g = Graph::new("dsl");
     let mut names: HashMap<String, u32> = HashMap::new();
 
-    for (lineno, raw) in src.lines().enumerate() {
-        let line = strip_comment(raw).trim();
+    for (lineno, orig) in src.lines().enumerate() {
+        let line = strip_comment(orig).trim();
         if line.is_empty() {
             continue;
         }
@@ -123,7 +123,7 @@ fn parse_node(
         dims: vec![-1, -1],
     };
     let out_v = g.add_value(out_ty, Some(out_name), nid);
-    g.raw.set_node_outputs(nid, &[out_v]);
+    g.storage.set_node_outputs(nid, &[out_v]);
     names.insert(out_name.to_string(), out_v);
 
     // 输入 value（引用已注册的 name）
@@ -137,7 +137,7 @@ fn parse_node(
             inputs.push(v);
         }
     }
-    g.raw.set_node_inputs(nid, &inputs);
+    g.storage.set_node_inputs(nid, &inputs);
     Ok(())
 }
 

@@ -129,12 +129,12 @@ pub fn apply_fusion(graph: &mut Graph, coeffs: CostCoeffs) -> Result<usize> {
             .collect();
 
         // 把链尾节点改成 Custom，inputs 重写
-        graph.raw.set_node_inputs(tail, &head_inputs);
-        graph.raw.node_hdr[tail as usize].op_tag = OpKind::Custom as u8;
+        graph.storage.set_node_inputs(tail, &head_inputs);
+        graph.storage.node_hdr[tail as usize].op_tag = OpKind::Custom as u8;
         // 记录融合的 op 序列到 attr（复用 Shape 的 int array 槽位）
         graph
-            .raw
-            .add_attr_int_array(tail, base::RawAttrKey::Shape, &op_seq);
+            .storage
+            .add_attr_int_array(tail, base::StorageAttrKey::Shape, &op_seq);
 
         // 链中其余节点（除链尾）标记删除
         for &n in &chain[..chain.len() - 1] {
@@ -174,8 +174,8 @@ mod tests {
             Some("r"),
             relu,
         );
-        g.raw.set_node_inputs(relu, &[x]);
-        g.raw.set_node_outputs(relu, &[r_out]);
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[r_out]);
         let add = g.add_node(OpKind::Add);
         let a_out = g.add_value(
             Type::Tensor {
@@ -185,8 +185,8 @@ mod tests {
             Some("a"),
             add,
         );
-        g.raw.set_node_inputs(add, &[r_out, x]);
-        g.raw.set_node_outputs(add, &[a_out]);
+        g.storage.set_node_inputs(add, &[r_out, x]);
+        g.storage.set_node_outputs(add, &[a_out]);
         g.mark_output(a_out);
         let opps = find_opportunities(&g, CostCoeffs::cuda()).unwrap();
         assert!(!opps.is_empty());
@@ -213,8 +213,8 @@ mod tests {
             Some("r"),
             relu,
         );
-        g.raw.set_node_inputs(relu, &[x]);
-        g.raw.set_node_outputs(relu, &[r_out]);
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[r_out]);
         let sigmoid = g.add_node(OpKind::Sigmoid);
         let s_out = g.add_value(
             Type::Tensor {
@@ -224,8 +224,8 @@ mod tests {
             Some("s"),
             sigmoid,
         );
-        g.raw.set_node_inputs(sigmoid, &[r_out]);
-        g.raw.set_node_outputs(sigmoid, &[s_out]);
+        g.storage.set_node_inputs(sigmoid, &[r_out]);
+        g.storage.set_node_outputs(sigmoid, &[s_out]);
         g.mark_output(s_out);
 
         let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
@@ -258,8 +258,8 @@ mod tests {
             Some("o"),
             relu,
         );
-        g.raw.set_node_inputs(relu, &[x]);
-        g.raw.set_node_outputs(relu, &[out]);
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[out]);
         g.mark_output(out);
         // 单节点链不应融合
         let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
