@@ -12,6 +12,9 @@
 //!   原本需两 op，融成单 Rsqrt。
 //! - **DivByReciprocal 融合**：`a / Reciprocal(b)` → `Mul(a, b)`（消去 Reciprocal+Div，
 //!   换便宜 Mul）。恒等式 `a/(1/b) = a·b`。除以倒数等于乘原数。
+//! - **ExpMulFusion 重排**：`Exp(x) * Exp(y)` → `Exp(x + y)`（省一个 Exp）。
+//!   恒等式 `e^x·e^y = e^(x+y)`。softmax/attention 里 exp 链相乘极常见，exp 是超越函数
+//!   贵，重排成单个 Exp + 便宜 Add。浮点代数重排（类 online-softmax 式），非贪心模式。
 //! - **DivByConstToMul**：`x / c` → `x * (1/c)`。除法 latency 远高于乘法，
 //!   预计算倒数转成乘法。注意：对 c=0 不做；浮点倒数有精度损失但可接受。
 //! - **MulByTwoToAdd**：`x * 2.0` → `x + x`。乘以 2 的幂可用 IEEE754 位级
@@ -58,6 +61,14 @@ pub enum FloatOpt {
         numerator: ValueId,
         recip_input: ValueId,
     },
+    /// `Exp(x) * Exp(y)` → `Exp(x + y)`（省一个 Exp）。e^x·e^y = e^(x+y)
+    ExpMulFusion {
+        mul_node: base::NodeId,
+        exp_x: base::NodeId,
+        exp_y: base::NodeId,
+        x_input: ValueId,
+        y_input: ValueId,
+    },
 }
 
 pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
@@ -81,6 +92,9 @@ pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
             }
             OpKind::Mul => {
                 if let Some(opt) = try_match_mul_by_two(graph, n)? {
+                    opts.push(opt);
+                }
+                if let Some(opt) = try_match_exp_mul(graph, n)? {
                     opts.push(opt);
                 }
             }
@@ -179,6 +193,41 @@ fn try_match_div_by_reciprocal(graph: &Graph, div: NodeView) -> Result<Option<Fl
         div_node: div.id,
         numerator,
         recip_input,
+    }))
+}
+
+/// 识别 `Exp(x) * Exp(y)`：Mul 节点，两个输入都是 Exp 节点输出。
+/// `e^x·e^y = e^(x+y)`，省一个 Exp（超越函数贵）。重排成 Exp(x+y) = Exp(Add(x,y))
+/// 注意：两个 Exp 必须是不同节点（x==y 时是 exp(x)²，不能融成 exp(2x) 的本规则，
+/// 那是另一类——但 exp(x)*exp(x)=exp(2x) 也成立，此处也覆盖：x==y 时 Add(x,x)=2x）
+fn try_match_exp_mul(graph: &Graph, mul: NodeView) -> Result<Option<FloatOpt>> {
+    let ins = mul.inputs();
+    if ins.len() != 2 {
+        return Ok(None);
+    }
+    let (a, b) = (ins[0], ins[1]);
+    let a_def = graph.value(a)?.def_node();
+    let b_def = graph.value(b)?.def_node();
+    if a_def == u32::MAX || b_def == u32::MAX {
+        return Ok(None);
+    }
+    let a_node = graph.node(a_def)?;
+    let b_node = graph.node(b_def)?;
+    if a_node.kind != OpKind::Exp || b_node.kind != OpKind::Exp {
+        return Ok(None);
+    }
+    let Some(&x_input) = a_node.inputs().first() else {
+        return Ok(None);
+    };
+    let Some(&y_input) = b_node.inputs().first() else {
+        return Ok(None);
+    };
+    Ok(Some(FloatOpt::ExpMulFusion {
+        mul_node: mul.id,
+        exp_x: a_def,
+        exp_y: b_def,
+        x_input,
+        y_input,
     }))
 }
 
@@ -320,6 +369,50 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                     .storage
                     .set_node_inputs(div_node, &[numerator, recip_input]);
                 graph.storage.node_hdr[div_node as usize].op_tag = OpKind::Mul as u8;
+                applied += 1;
+            }
+            FloatOpt::ExpMulFusion {
+                mul_node,
+                exp_x,
+                exp_y: _,
+                x_input,
+                y_input,
+            } => {
+                // Exp(x)*Exp(y) → Exp(Add(x,y))：新建 Add 节点吃 [x,y]，复用 exp_x 节点
+                // 改吃 Add 输出（op 不变仍是 Exp），Mul 节点变孤儿交给 DCE。
+                // 结果用 exp_x 的输出 value（仍指向 exp_x），值等于原 Mul 输出，
+                // 故把 Mul 输出的所有使用者重写到 exp_x 的输出
+                let add_node = graph.add_node(OpKind::Add);
+                let add_out =
+                    graph.add_value(type_of_value(graph, x_input)?, Some("sum"), add_node);
+                graph.storage.set_node_inputs(add_node, &[x_input, y_input]);
+                graph.storage.set_node_outputs(add_node, &[add_out]);
+                // exp_x 节点改吃 Add 输出
+                graph.storage.set_node_inputs(exp_x, &[add_out]);
+                // 把 Mul 输出的使用者重写到 exp_x 的输出（值相等）
+                let mul_outs: Vec<ValueId> = graph.node(mul_node)?.outputs().to_vec();
+                let exp_x_outs: Vec<ValueId> = graph.node(exp_x)?.outputs().to_vec();
+                if let (Some(&exp_out), Some(&mul_out)) = (exp_x_outs.first(), mul_outs.first()) {
+                    let node_ids: Vec<u32> = graph.node_ids().collect();
+                    for nid in node_ids {
+                        let old_inputs: Vec<ValueId> = graph.node(nid)?.inputs().to_vec();
+                        if old_inputs.contains(&mul_out) {
+                            let new_inputs: Vec<ValueId> = old_inputs
+                                .iter()
+                                .map(|&v| if v == mul_out { exp_out } else { v })
+                                .collect();
+                            graph.storage.set_node_inputs(nid, &new_inputs);
+                        }
+                    }
+                    let old_outputs: Vec<ValueId> = graph.outputs().to_vec();
+                    if old_outputs.contains(&mul_out) {
+                        let new_outputs: Vec<ValueId> = old_outputs
+                            .iter()
+                            .map(|&v| if v == mul_out { exp_out } else { v })
+                            .collect();
+                        graph.storage.outputs = new_outputs;
+                    }
+                }
                 applied += 1;
             }
             FloatOpt::SoftmaxOnline { .. } => {
@@ -673,6 +766,58 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, FloatOpt::DivByReciprocal { .. })),
             "Reciprocal(a)/b 不应触发 DivByReciprocal（除数不是 Reciprocal）"
+        );
+    }
+
+    /// `Exp(x) * Exp(y)` → `Exp(Add(x,y))`（省一个 Exp）。e^x·e^y = e^(x+y)
+    #[test]
+    fn exp_mul_fuses_to_exp_add() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let y = g.add_input(Type::Scalar(DType::F32), Some("y"));
+        let exp_x = g.add_node(OpKind::Exp);
+        let ex_out = g.add_value(Type::Scalar(DType::F32), Some("ex"), exp_x);
+        g.storage.set_node_inputs(exp_x, &[x]);
+        g.storage.set_node_outputs(exp_x, &[ex_out]);
+        let exp_y = g.add_node(OpKind::Exp);
+        let ey_out = g.add_value(Type::Scalar(DType::F32), Some("ey"), exp_y);
+        g.storage.set_node_inputs(exp_y, &[y]);
+        g.storage.set_node_outputs(exp_y, &[ey_out]);
+        let mul = g.add_node(OpKind::Mul);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), mul);
+        g.storage.set_node_inputs(mul, &[ex_out, ey_out]);
+        g.storage.set_node_outputs(mul, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // 应新建 1 个 Add 节点吃 [x,y]；复用的 exp_x 改吃 Add 输出。
+        // exp_y 变孤儿（apply 不删，交给 DCE），此处不检查节点数，只验证重排正确。
+        let add_count = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Add)
+            .count();
+        assert_eq!(add_count, 1, "应新建 1 个 Add 节点");
+        let add_node = g
+            .node_ids()
+            .find(|&id| g.node(id).unwrap().kind == OpKind::Add)
+            .unwrap();
+        assert_eq!(
+            g.node(add_node).unwrap().inputs(),
+            &[x, y],
+            "Add 输入应是 [x, y]"
+        );
+        // exp_x 节点（复用为结果）输入应已换成 Add 输出
+        let add_out = g.node(add_node).unwrap().outputs()[0];
+        assert_eq!(
+            g.node(exp_x).unwrap().inputs(),
+            &[add_out],
+            "复用的 exp_x 输入应是 Add 输出"
+        );
+        // Mul 的输出使用者应被重写到 exp_x 的输出（图输出 out 应指向 exp_x_out）
+        assert!(
+            g.outputs().contains(&ex_out),
+            "图输出应重写到 exp_x 的输出"
         );
     }
 }
