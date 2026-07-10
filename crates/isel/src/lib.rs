@@ -54,6 +54,7 @@ pub fn default_rules() -> Vec<Rule> {
         // 超越函数
         r#"(rule (when (= op "sqrt"))   (emit "sqrt"  "x"))"#,
         r#"(rule (when (= op "rsqrt"))  (emit "rsqrt" "x"))"#,
+        r#"(rule (when (= op "reciprocal")) (emit "reciprocal" "x"))"#,
         r#"(rule (when (= op "exp"))    (emit "exp"   "x"))"#,
         r#"(rule (when (= op "pow"))    (emit "pow"   "x" "y"))"#,
         // reduce
@@ -68,6 +69,9 @@ pub fn default_rules() -> Vec<Rule> {
         r#"(rule (when (= op "load"))   (emit "load"  "addr"))"#,
         r#"(rule (when (= op "store"))  (emit "store" "addr" "v"))"#,
         r#"(rule (when (= op "const"))  (emit "const" "imm"))"#,
+        // 融合产物（fuse pass 产，attr 记 op 序列）；未知 ONNX 算子（frontend 产）
+        r#"(rule (when (= op "fused"))  (emit "fused" "x"))"#,
+        r#"(rule (when (= op "custom")) (emit "custom" "x"))"#,
     ];
     srcs.iter().map(|s| parse_rule(s).unwrap()).collect()
 }

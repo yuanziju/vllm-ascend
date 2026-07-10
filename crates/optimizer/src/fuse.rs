@@ -1,6 +1,6 @@
 //! fuse — 多对一启发式融合（基于 cost model）
 //!
-//! 设计哲学：把可融合的算子链合成单个 Custom 节点，省 launch overhead +
+//! 设计哲学：把可融合的算子链合成单个 Fused 节点，省 launch overhead +
 //! 中间结果访存。用 cost_model 判定融合收益（只融合收益 > 0 的链）。
 //!
 //! 融合策略：
@@ -8,8 +8,11 @@
 //! - 链头允许一个 reduce（reduce 改变 shape，是 shape 分界点，不再往前扩）
 //! - binary elementwise（Add/Sub/Mul/Div）的"另一输入"作为 side input 收集，
 //!   融合后节点 inputs = 链头 inputs + 各 binary 的 side inputs（按链序）
-//! - 链尾节点 op 改成 Custom，attr 记录 op 序列 + side input 位置
+//! - 链尾节点 op 改成 Fused，attr 记录 op 序列 + side input 位置
 //! - 链中其余节点变死代码，由 DCE 清理
+//!
+//! **Fused vs Custom**：Fused 专管融合产物（本 pass 产生），Custom 留给未知 ONNX 算子
+//! （frontend 产生）。lowering 按 op_kind 直接分派，不靠 attr 探测猜语义。
 //!
 //! 属性编码（供 lowering 重建）：
 //! - `Shape`（IntArray）：op 序列 [op0, op1, ...]（每个是 OpKind as u8）
@@ -60,7 +63,7 @@ pub fn find_opportunities(graph: &Graph, coeffs: CostCoeffs) -> Result<Vec<Fusio
 fn is_elementwise(kind: OpKind) -> bool {
     // 注意：Rsqrt 故意不在此列——它作为融合边界保留为独立 op，
     // 让 lowering 能发专用 rsqrt kernel（0x5f3759df 位 trick），
-    // 而非被融进 elementwise 链变成 Custom 节点
+    // 而非被融进 elementwise 链变成 Fused 节点
     matches!(
         kind,
         OpKind::Add
@@ -197,7 +200,7 @@ fn is_exclusively_used(graph: &Graph, v: ValueId, consumer: base::NodeId) -> Res
     Ok(true)
 }
 
-/// 应用融合：把每条链的链尾节点改成 Custom，inputs 重写为 链头 inputs + side inputs。
+/// 应用融合：把每条链的链尾节点改成 Fused，inputs 重写为 链头 inputs + side inputs。
 /// 链中其余节点变死代码（DCE 清理）。返回应用次数。
 ///
 /// 机会按 saving 降序处理；已被某条融合链消费的节点不再参与后续链（避免重叠
@@ -206,7 +209,7 @@ pub fn apply_fusion(graph: &mut Graph, coeffs: CostCoeffs) -> Result<usize> {
     let opps = find_opportunities(graph, coeffs)?;
     let mut applied = 0usize;
     let mut to_remove: std::collections::HashSet<base::NodeId> = std::collections::HashSet::new();
-    // 已被某条融合链消费的节点（含链尾 Custom 节点本身），后续链不可再碰
+    // 已被某条融合链消费的节点（含链尾 Fused 节点本身），后续链不可再碰
     let mut consumed: std::collections::HashSet<base::NodeId> = std::collections::HashSet::new();
 
     for opp in opps {
@@ -233,9 +236,9 @@ pub fn apply_fusion(graph: &mut Graph, coeffs: CostCoeffs) -> Result<usize> {
             .map(|&n| graph.node(n).map(|v| v.kind as u8 as i64).unwrap_or(0))
             .collect();
 
-        // 把链尾节点改成 Custom，inputs 重写
+        // 把链尾节点改成 Fused，inputs 重写
         graph.storage.set_node_inputs(tail, &fused_inputs);
-        graph.storage.node_hdr[tail as usize].op_tag = OpKind::Custom as u8;
+        graph.storage.node_hdr[tail as usize].op_tag = OpKind::Fused as u8;
         // op 序列 → Shape attr；side input 位置 → Strides attr
         graph
             .storage
@@ -360,10 +363,10 @@ mod tests {
 
         let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
         assert!(count >= 1, "应至少融合一条链");
-        // 融合后应只剩 1 个节点（Custom），relu 被删
-        assert_eq!(g.node_count(), 1, "融合后应剩 1 个 Custom 节点");
+        // 融合后应只剩 1 个节点（Fused），relu 被删
+        assert_eq!(g.node_count(), 1, "融合后应剩 1 个 Fused 节点");
         let n = g.node(0).unwrap();
-        assert_eq!(n.kind, OpKind::Custom, "链尾应改成 Custom");
+        assert_eq!(n.kind, OpKind::Fused, "链尾应改成 Fused");
         // 输入应重写为链头输入 x（compact 后 x 仍存在，因它是图输入）
         assert_eq!(n.inputs().len(), 1, "应有 1 个输入");
         assert_eq!(g.inputs().len(), 1, "图应保留 1 个输入 x");
@@ -435,13 +438,13 @@ mod tests {
 
         let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
         assert_eq!(count, 1);
-        // 融合后应只剩 1 个 Custom 节点（原 sigmoid 尾节点改 Custom，reduce 被 compact 删）
+        // 融合后应只剩 1 个 Fused 节点（原 sigmoid 尾节点改 Fused，reduce 被 compact 删）
         let customs: Vec<_> = g
             .node_ids()
-            .filter(|&id| g.node(id).unwrap().kind == OpKind::Custom)
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Fused)
             .collect();
         assert_eq!(customs.len(), 1);
-        // Custom 节点应保留 reduce 的 axis attr
+        // Fused 节点应保留 reduce 的 axis attr
         let custom = customs[0];
         let has_axis = g
             .node(custom)
@@ -560,10 +563,10 @@ mod tests {
 
         let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
         assert_eq!(count, 1, "reduce→add 应融合");
-        // 融合后应只剩 1 个 Custom 节点
+        // 融合后应只剩 1 个 Fused 节点
         let customs: Vec<_> = g
             .node_ids()
-            .filter(|&id| g.node(id).unwrap().kind == OpKind::Custom)
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Fused)
             .collect();
         assert_eq!(customs.len(), 1);
         let custom = customs[0];
@@ -653,7 +656,7 @@ mod tests {
         assert_eq!(count, 1, "relu→add→mul 应融成一条链");
         let customs: Vec<_> = g
             .node_ids()
-            .filter(|&id| g.node(id).unwrap().kind == OpKind::Custom)
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Fused)
             .collect();
         assert_eq!(customs.len(), 1);
         let ins = g.node(customs[0]).unwrap().inputs();
