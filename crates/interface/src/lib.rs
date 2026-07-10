@@ -270,4 +270,57 @@ mod tests {
             "Fused 节点与 'fused' 指令应一致出现"
         );
     }
+
+    // --- 端到端：Reciprocal(Sqrt(x)) → Rsqrt 全链路（O2 含 fusion）---
+
+    /// RMSNorm 风格的 `Reciprocal(Sqrt(x))` 模式：float_opts 的 ReciprocalSqrt
+    /// 应把它融合成 Rsqrt（2 op 降 1 op），全链路通 lowering/isel。直接用 base API
+    /// 构图（不走 ONNX 解析，聚焦优化 + 后端链路）
+    #[test]
+    fn reciprocal_sqrt_pipeline_fuses_to_rsqrt() {
+        use base::{Graph, OpKind, Type};
+        let mut graph = Graph::new("rmsnorm");
+        let ty = Type::Tensor {
+            dtype: base::DType::F32,
+            dims: vec![2, 3],
+        };
+        let x = graph.add_input(ty.clone(), Some("x"));
+        let sqrt = graph.add_node(OpKind::Sqrt);
+        let sqrt_out = graph.add_value(ty.clone(), Some("sx"), sqrt);
+        graph.storage.set_node_inputs(sqrt, &[x]);
+        graph.storage.set_node_outputs(sqrt, &[sqrt_out]);
+        let recip = graph.add_node(OpKind::Reciprocal);
+        let out = graph.add_value(ty, Some("out"), recip);
+        graph.storage.set_node_inputs(recip, &[sqrt_out]);
+        graph.storage.set_node_outputs(recip, &[out]);
+        graph.mark_output(out);
+
+        let mut pm = optimizer::PassManager::default_for(OptLevel::O2, Target::Cuda);
+        pm.run(&mut graph).unwrap();
+
+        // Reciprocal(Sqrt(x)) 应被 float_opts 融合成 Rsqrt
+        let has_rsqrt = graph.node_ids().any(|id| {
+            graph
+                .node(id)
+                .map(|n| n.kind == base::OpKind::Rsqrt)
+                .unwrap_or(false)
+        });
+        assert!(has_rsqrt, "Reciprocal(Sqrt(x)) 应融合成 Rsqrt");
+        // 原始 Reciprocal 节点不应再以 Reciprocal 形式存在（已改 Rsqrt）
+        let has_recip = graph.node_ids().any(|id| {
+            graph
+                .node(id)
+                .map(|n| n.kind == base::OpKind::Reciprocal)
+                .unwrap_or(false)
+        });
+        assert!(!has_recip, "不应残留 Reciprocal 节点（应已变 Rsqrt）");
+
+        // 全链路：lowering 发 rsqrt kernel、isel 选 rsqrt 指令
+        let arch_graph = arch::lower(&graph, Target::Cuda).unwrap();
+        let instrs = isel::select(&arch_graph).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.op == "rsqrt"),
+            "isel 应为 Rsqrt 选出 'rsqrt' 指令"
+        );
+    }
 }
