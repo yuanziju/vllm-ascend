@@ -177,3 +177,31 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 3. isel：用 lisp 解释器驱动 isel 规则匹配
 4. algebra 扩展：常量传播、shape 推断后基于 shape 的简化
 5. fuse 可扩展：reduce + elementwise 融合（目前只做 elementwise 链）
+
+### 2026-07-10 — isel lisp 规则化 + frontend 真解析（feat/neutron-bf91af14）
+
+**当前状态**：isel 从硬编码 match 改为 lisp 规则驱动；frontend 从占位改为真正的 ONNX protobuf 解析 + 文本 DSL 解析。回归全绿。本分支待合并回 main。
+
+**已完成**：
+- **isel 规则化**：从硬编码 match 改为 S-expr 规则 `(rule (when <cond>) (emit <op> <args>...))`。规则由 lisp 解释器求值，绑定 `op`/`idx`/`target` 上下文变量。默认规则集覆盖 21 个 native kernel。未知 op 报错（强制写规则，不静默漏）。8 单测
+- **lisp 增强**：interp 加 `and`/`or` 短路逻辑特殊形式 + `not`/`str`（字符串拼接）/`str=` 内建函数；parser 加 `"..."` 字符串字面量解析（带转义）。isel 规则的条件表达式和 emit 参数现在能用字符串字面量
+- **frontend ONNX 真解析**：手写极简 protobuf wire-format 读取器（`proto.rs`，无 prost/prost-build 重依赖），解出 ModelProto→GraphProto→NodeProto 的 op_type/input/output/name/initializer/input/output 字段。ONNX op_type→OpKind 映射覆盖 26 个常见算子，未知算子→Custom（attr 记录原始 op_type 字符码）。名称注册表做 SSA 去重。8 单测（含手工编码 ONNX 字节流的端到端解析）
+- **frontend DSL 解析**：极简文本格式 `in x: f32[2,3]` / `y = relu(x)` / `out z`，支持注释。方便手写测试图，不依赖 ONNX 二进制。5 单测
+- **proto.rs**：独立模块，Cursor 读 varint/length-delimited/tag/skip_field。4 单测
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：53 passed (common 2 + frontend 13 + interface 1 + isel 8 + lisp 4 + optimizer 25)
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
+
+**设计哲学遵守**：isel 规则化符合"规则用函数实现，后期再抽象"——现在是 lisp 规则（可热加载、可读、可扩展），比硬编码 match 灵活。frontend 不引 prost 重依赖，手写 protobuf 解码器符合"简单"哲学。未知算子映射 Custom 不报错（前向兼容），但 isel 无规则匹配会报错（强制完整性）。
+
+**下一步**（优先级排序）：
+1. 合并 feat/neutron-bf91af14 → main
+2. algebra 扩展：常量传播、shape 推断后基于 shape 的简化
+3. fuse 可扩展：reduce + elementwise 融合（目前只做 elementwise 链）
+4. isel 规则从文件加载（热加载，不重编译）
+5. frontend：解析 ONNX 属性（axis/epsilon 等），喂给 decompose 的 read_axis/read_epsilon
+6. pt 前端：PyTorch 解析（当前占位）

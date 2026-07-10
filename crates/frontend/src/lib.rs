@@ -2,6 +2,7 @@
 
 pub mod dsl;
 pub mod onnx;
+pub mod proto;
 pub mod pt;
 
 pub use onnx::parse as parse_onnx;

@@ -51,6 +51,26 @@ impl Interp {
                         }
                         Ok(result)
                     }
+                    // 短路逻辑 and / or（特殊形式，不求值全部参数）
+                    "and" => {
+                        let mut result = Val::Bool(true);
+                        for item in &items[1..] {
+                            result = self.eval(item)?;
+                            if matches!(result, Val::Bool(false) | Val::Nil) {
+                                return Ok(result);
+                            }
+                        }
+                        Ok(result)
+                    }
+                    "or" => {
+                        for item in &items[1..] {
+                            let v = self.eval(item)?;
+                            if !matches!(v, Val::Bool(false) | Val::Nil) {
+                                return Ok(v);
+                            }
+                        }
+                        Ok(Val::Bool(false))
+                    }
                     _ => {
                         // 函数应用
                         let args: Vec<Val> = items[1..]
@@ -190,6 +210,27 @@ fn call_builtin(name: &str, args: &[Val]) -> Result<Val, String> {
             let b = to_float(&args[1])?;
             Ok(Val::Bool(a < b))
         }
+        "not" => {
+            if args.len() != 1 {
+                return Err("not 需要恰好 1 个参数".into());
+            }
+            Ok(Val::Bool(matches!(&args[0], Val::Bool(false) | Val::Nil)))
+        }
+        // 字符串拼接：所有参数转字符串后拼接
+        "str" => {
+            let mut s = String::new();
+            for a in args {
+                s.push_str(&val_to_str(a));
+            }
+            Ok(Val::Str(s))
+        }
+        // 字符串相等（= 已用 PartialEq 处理，但 Sym!=Str 时补一个显式 str=）
+        "str=" => {
+            if args.len() != 2 {
+                return Err("str= 需要恰好 2 个参数".into());
+            }
+            Ok(Val::Bool(val_to_str(&args[0]) == val_to_str(&args[1])))
+        }
         _ => Err(format!("未知函数: {}", name)),
     }
 }
@@ -199,6 +240,30 @@ fn to_float(v: &Val) -> Result<f64, String> {
         Val::Int(i) => Ok(*i as f64),
         Val::Float(f) => Ok(*f),
         _ => Err(format!("期望数值: {}", v)),
+    }
+}
+
+/// 把 lisp Val 转成字符串（str/str= 内建函数用）
+fn val_to_str(v: &Val) -> String {
+    match v {
+        Val::Nil => "nil".to_string(),
+        Val::Bool(b) => b.to_string(),
+        Val::Int(i) => i.to_string(),
+        Val::Float(f) => f.to_string(),
+        Val::Sym(s) => s.clone(),
+        Val::Str(s) => s.clone(),
+        Val::List(items) => {
+            let mut s = String::from("(");
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    s.push(' ');
+                }
+                s.push_str(&val_to_str(it));
+            }
+            s.push(')');
+            s
+        }
+        Val::Lambda { .. } => "<lambda>".to_string(),
     }
 }
 

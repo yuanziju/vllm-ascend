@@ -45,11 +45,34 @@ impl<'a> Parser<'a> {
         match self.chars.peek() {
             None => Err("意外的输入结束".into()),
             Some(&'(') => self.parse_list(),
+            Some(&'"') => self.parse_string(),
             Some(&'\'') => {
                 self.chars.next();
                 Ok(Val::Str("quote".into()))
             }
             Some(_) => self.parse_atom(),
+        }
+    }
+
+    /// 解析双引号字符串字面量（支持 \" 转义）
+    fn parse_string(&mut self) -> Result<Val, String> {
+        // 吃掉开头的 '"'
+        self.chars.next();
+        let mut s = String::new();
+        loop {
+            match self.chars.next() {
+                None => return Err("未闭合的字符串字面量".into()),
+                Some('"') => return Ok(Val::Str(s)),
+                Some('\\') => match self.chars.next() {
+                    Some('n') => s.push('\n'),
+                    Some('t') => s.push('\t'),
+                    Some('"') => s.push('"'),
+                    Some('\\') => s.push('\\'),
+                    Some(c) => s.push(c),
+                    None => return Err("转义序列意外结束".into()),
+                },
+                Some(c) => s.push(c),
+            }
         }
     }
 
