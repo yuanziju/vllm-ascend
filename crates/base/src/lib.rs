@@ -246,14 +246,42 @@ impl<'a> NodeView<'a> {
         self.storage.node_attrs(self.id)
     }
 
-    /// 若节点是 Constant 且带 AttrKey::Value (Float) 属性，返回其标量值。
+    /// 若节点是 Constant 且带 AttrKey::Value 属性，返回其标量值。
+    ///
+    /// 支持两种存储形式：
+    /// - `Value=Float`（标量常量，由 `add_constant_f64` 创建）——直接返回
+    /// - `Value=FloatArray` 且恰好 1 个元素（单元素张量常量，如 ONNX initializer
+    ///   shape=[] 或 [1]）——返回该元素，让 algebra/float_opts 等基于标量的 pass
+    ///   也能识别从 ONNX 读入的广播标量
+    ///
+    /// 多元素张量常量返回 None（用 `constant_tensor` 取完整数据）。
     pub fn constant_value(&self) -> Option<f64> {
         if self.kind != OpKind::Constant {
             return None;
         }
+        let mut float_arr: Option<&[f64]> = None;
         for e in self.attrs() {
-            if e.key == AttrKey::Value as u8 && e.tag == storage::AttrTag::Float as u8 {
-                return Some(self.storage.attr_float(e));
+            if e.key == AttrKey::Value as u8 {
+                if e.tag == storage::AttrTag::Float as u8 {
+                    return Some(self.storage.attr_float(e));
+                }
+                if e.tag == storage::AttrTag::FloatArray as u8 {
+                    float_arr = Some(self.storage.attr_float_array(e));
+                }
+            }
+        }
+        float_arr.and_then(|a| if a.len() == 1 { Some(a[0]) } else { None })
+    }
+
+    /// 若节点是 Constant 且带 AttrKey::Value=FloatArray，返回完整张量数据。
+    /// 标量常量（Value=Float）返回 None。
+    pub fn constant_tensor(&self) -> Option<&[f64]> {
+        if self.kind != OpKind::Constant {
+            return None;
+        }
+        for e in self.attrs() {
+            if e.key == AttrKey::Value as u8 && e.tag == storage::AttrTag::FloatArray as u8 {
+                return Some(self.storage.attr_float_array(e));
             }
         }
         None

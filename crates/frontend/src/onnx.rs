@@ -15,6 +15,12 @@
 //! - Transpose 的 perm → AttrKey::Perm
 //! - Reshape 的 shape（attr 形式）→ AttrKey::Shape
 //!
+//! initializer 解析：GraphProto.initializer (field 5, TensorProto) 解出
+//! name + dims + data_type + 数据（raw_data 或 float_data/double_data）。
+//! FLOAT/DOUBLE 张量映射成 Constant 节点，输出 value 带 dims shape、
+//! Value attr 存 FloatArray（多元素）或 Float（单元素，让 algebra/float_opts
+//! 等基于标量的 pass 立即可用）。其余 dtype 暂只取 name 退化成未知输入。
+//!
 //! 其余属性暂忽略（前向兼容，不报错）。
 //!
 //! Protobuf 字段编号参考 ONNX schema：
@@ -25,6 +31,9 @@
 //! - AttributeProto: 1=name(string), 3=type(varint), 4=f(FIXED32 float),
 //!   5=i(varint int64), 6=s(bytes), 7=t(TensorProto), 20=floats(packed),
 //!   21=ints(packed repeated int64)
+//! - TensorProto: 1=dims(packed int64), 2=data_type(varint), 4=float_data(packed f32),
+//!   5=int32_data(packed), 6=int64_data(packed), 7=double_data(packed f64),
+//!   8=name(string), 9=raw_data(bytes)
 
 use base::StorageAttrKey;
 use base::{DType, Graph, OpKind, Result, Type};
@@ -57,24 +66,58 @@ pub fn parse(bytes: &[u8]) -> Result<Graph> {
         registry.register(name.clone(), v);
         g.mark_input(v);
     }
-    // initializer（GraphProto.initializer，field 5）作为常量输入
-    for name in &model.initializers {
-        if registry.get(name).is_none() {
+    // initializer（GraphProto.initializer，field 5）作为 Constant 节点。
+    // FLOAT/DOUBLE 且解出数据 → Constant 节点带 Value attr（FloatArray/Float）
+    //   + 输出 value 带真实 dims shape，让 shape_infer/cost_model/algebra 都能用上
+    // 其余 dtype（INT32/INT64/...）或无数据 → 退化成未知 shape 输入（前向兼容）
+    for t in &model.initializers {
+        if registry.get(&t.name).is_some() {
+            continue;
+        }
+        if !t.values.is_empty() && (t.data_type == 1 || t.data_type == 11) {
+            // 映射成 Constant 节点
+            let nid = g.add_node(OpKind::Constant);
+            // 输出 value shape：用 dims（标量 [] 用空 shape 表示 rank 0）
+            let out = g.add_value(
+                Type::Tensor {
+                    dtype: DType::F32,
+                    dims: t.dims.clone(),
+                },
+                Some(&t.name),
+                nid,
+            );
+            g.storage.set_node_outputs(nid, &[out]);
+            // Value attr：单元素存 Float（让 constant_value() 立即返回），
+            // 多元素存 FloatArray（constant_tensor() 可读完整数据）
+            if t.values.len() == 1 {
+                g.storage
+                    .add_attr_float(nid, base::StorageAttrKey::Value, t.values[0]);
+            } else {
+                g.storage
+                    .add_attr_float_array(nid, base::StorageAttrKey::Value, &t.values);
+            }
+            registry.register(t.name.clone(), out);
+        } else {
+            // 退化：未知 dtype 或无数据，按未知 shape 输入注册
             let v = g.add_input(
                 Type::Tensor {
                     dtype: DType::F32,
                     dims: vec![-1],
                 },
-                Some(name),
+                Some(&t.name),
             );
-            registry.register(name.clone(), v);
+            registry.register(t.name.clone(), v);
         }
     }
 
-    // 节点
+    // 节点（第一遍：分配 NodeId + 创建输出 value + 应用属性）
+    // 记录每个节点对应的真实 NodeId（initializer 的 Constant 节点已占用了前面的 ID，
+    // 不能用 node_idx 直接当 NodeId）
+    let mut node_ids: Vec<base::NodeId> = Vec::with_capacity(model.nodes.len());
     for node in &model.nodes {
         let kind = map_op_type(&node.op_type);
         let nid = g.add_node(kind);
+        node_ids.push(nid);
         // 未知 op_type 记录到 attr（Custom 槽位用 Shape int array 存字符 code 点）
         if matches!(kind, OpKind::Custom) {
             let codes: Vec<i64> = node.op_type.chars().map(|c| c as i64).collect();
@@ -107,8 +150,8 @@ pub fn parse(bytes: &[u8]) -> Result<Graph> {
     }
 
     // 第二遍：填充每个节点的 inputs（引用已注册的 value）
-    for (node_idx, node) in model.nodes.iter().enumerate() {
-        let nid = node_idx as u32;
+    for (i, node) in model.nodes.iter().enumerate() {
+        let nid = node_ids[i];
         let inputs: Vec<u32> = node
             .inputs
             .iter()
@@ -173,7 +216,18 @@ struct ModelInfo {
     nodes: Vec<NodeInfo>,
     inputs: Vec<String>,
     outputs: Vec<String>,
-    initializers: Vec<String>,
+    initializers: Vec<TensorInfo>,
+}
+
+/// TensorProto 解析结果。values 仅对 FLOAT/DOUBLE 填充（其余 dtype 留空）。
+#[derive(Debug, Default)]
+struct TensorInfo {
+    name: String,
+    dims: Vec<i64>,
+    /// ONNX TensorProto.data_type：1=FLOAT, 11=DOUBLE, 6=INT32, 7=INT64, ...
+    /// 0 表示未指定。
+    data_type: i64,
+    values: Vec<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -229,7 +283,7 @@ struct GraphInfo {
     nodes: Vec<NodeInfo>,
     inputs: Vec<String>,
     outputs: Vec<String>,
-    initializers: Vec<String>,
+    initializers: Vec<TensorInfo>,
 }
 
 fn parse_graph(buf: &[u8]) -> Result<GraphInfo> {
@@ -251,8 +305,9 @@ fn parse_graph(buf: &[u8]) -> Result<GraphInfo> {
             // GraphProto.initializer = field 5, repeated LEN (TensorProto)
             (5, 2) => {
                 let tensor_buf = c.read_length_delimited()?;
-                if let Some(name) = parse_tensor_name(tensor_buf)? {
-                    g.initializers.push(name);
+                let t = parse_tensor(tensor_buf)?;
+                if !t.name.is_empty() {
+                    g.initializers.push(t);
                 }
             }
             // GraphProto.input = field 11, repeated ValueInfoProto
@@ -387,21 +442,119 @@ fn parse_attribute(buf: &[u8]) -> Result<AttrInfo> {
     Ok(AttrInfo { name, value })
 }
 
-/// 从 TensorProto 解出 name（field 8）。其余字段忽略。
-fn parse_tensor_name(buf: &[u8]) -> Result<Option<String>> {
+/// 解析 TensorProto：name(8) + dims(1, packed int64) + data_type(2, varint)
+/// + raw_data(9, bytes) + float_data(4, packed f32) + double_data(7, packed f64)。
+///
+/// values 仅对 FLOAT(1)/DOUBLE(11) 填充：
+/// - 优先 raw_data（小端原生字节），其次 float_data/double_data（packed）
+/// - 其余 dtype（INT32/INT64/...）values 留空，调用方按 name 退化处理
+fn parse_tensor(buf: &[u8]) -> Result<TensorInfo> {
     let mut c = Cursor::new(buf);
-    let mut name = None;
+    let mut t = TensorInfo::default();
     while !c.eof() {
         let (field, wt) = c.read_tag()?;
         match (field, wt) {
+            // dims (repeated int64, packed LEN；也可能非打包单元素)
+            (1, 2) => {
+                let buf2 = c.read_length_delimited()?;
+                let mut c2 = Cursor::new(buf2);
+                while !c2.eof() {
+                    t.dims.push(c2.read_varint()? as i64);
+                }
+            }
+            (1, 0) => {
+                t.dims.push(c.read_varint()? as i64);
+            }
+            // data_type (varint)
+            (2, 0) => {
+                t.data_type = c.read_varint()? as i64;
+            }
+            // float_data (repeated float, packed LEN) — each 4 bytes LE f32
+            (4, 2) => {
+                let buf2 = c.read_length_delimited()?;
+                let mut i = 0;
+                while i + 4 <= buf2.len() {
+                    let bytes = [buf2[i], buf2[i + 1], buf2[i + 2], buf2[i + 3]];
+                    t.values.push(f32::from_le_bytes(bytes) as f64);
+                    i += 4;
+                }
+            }
+            // float_data 非打包单元素 (FIXED32)
+            (4, 5) => {
+                if c.pos + 4 > c.data.len() {
+                    return Err(base::NeutronError::Frontend(
+                        "TensorProto.float_data 越界".into(),
+                    ));
+                }
+                let bytes = [
+                    c.data[c.pos],
+                    c.data[c.pos + 1],
+                    c.data[c.pos + 2],
+                    c.data[c.pos + 3],
+                ];
+                c.pos += 4;
+                t.values.push(f32::from_le_bytes(bytes) as f64);
+            }
+            // double_data (repeated double, packed LEN) — each 8 bytes LE f64
+            (7, 2) => {
+                let buf2 = c.read_length_delimited()?;
+                let mut i = 0;
+                while i + 8 <= buf2.len() {
+                    let bytes: [u8; 8] = buf2[i..i + 8].try_into().unwrap();
+                    t.values.push(f64::from_le_bytes(bytes));
+                    i += 8;
+                }
+            }
+            (7, 1) => {
+                // double_data 非打包单元素 (FIXED64)
+                if c.pos + 8 > c.data.len() {
+                    return Err(base::NeutronError::Frontend(
+                        "TensorProto.double_data 越界".into(),
+                    ));
+                }
+                let bytes: [u8; 8] = c.data[c.pos..c.pos + 8].try_into().unwrap();
+                c.pos += 8;
+                t.values.push(f64::from_le_bytes(bytes));
+            }
+            // name (string)
             (8, 2) => {
                 let s = c.read_length_delimited()?;
-                name = Some(read_string_field(s)?);
+                t.name = read_string_field(s)?;
             }
+            // raw_data (bytes) — 小端原生字节。仅 FLOAT/DOUBLE 解码
+            (9, 2) => {
+                let raw = c.read_length_delimited()?;
+                if t.data_type == 1 {
+                    // FLOAT: 4 字节 LE f32
+                    let mut i = 0;
+                    let mut v = Vec::with_capacity(raw.len() / 4);
+                    while i + 4 <= raw.len() {
+                        let bytes = [raw[i], raw[i + 1], raw[i + 2], raw[i + 3]];
+                        v.push(f32::from_le_bytes(bytes) as f64);
+                        i += 4;
+                    }
+                    if !v.is_empty() {
+                        t.values = v;
+                    }
+                } else if t.data_type == 11 {
+                    // DOUBLE: 8 字节 LE f64
+                    let mut i = 0;
+                    let mut v = Vec::with_capacity(raw.len() / 8);
+                    while i + 8 <= raw.len() {
+                        let bytes: [u8; 8] = raw[i..i + 8].try_into().unwrap();
+                        v.push(f64::from_le_bytes(bytes));
+                        i += 8;
+                    }
+                    if !v.is_empty() {
+                        t.values = v;
+                    }
+                }
+            }
+            // int32_data(5)/int64_data(6)/string_data(3)/uint64_data(12) 暂不解码
             _ => c.skip_field(wt)?,
         }
     }
-    Ok(name)
+    Ok(t)
 }
 
 /// 从 ValueInfoProto 解出 name（field 1）。其余字段忽略。
@@ -802,5 +955,244 @@ mod tests {
         assert_eq!(rs.len(), 1);
         // keepdims 不映射到任何 attr，故 Axis 应为 None
         assert_eq!(read_axis_attr(&g, rs[0]), None, "未知属性应被忽略");
+    }
+
+    // --- initializer 张量数据解析测试 ---
+
+    /// 写 varint 字段（field, wt=0, value）
+    fn write_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
+        write_tag(buf, field, 0);
+        write_varint(buf, value);
+    }
+
+    /// 构造 packed int64 字段（field, wt=2, payload=各 varint）
+    fn write_packed_int64_field(buf: &mut Vec<u8>, field: u32, values: &[i64]) {
+        let mut payload = Vec::new();
+        for &v in values {
+            write_varint(&mut payload, v as u64);
+        }
+        write_len_field(buf, field, &payload);
+    }
+
+    /// 构造 packed float 字段（field, wt=2, payload=各 LE f32）
+    fn write_packed_float_field(buf: &mut Vec<u8>, field: u32, values: &[f32]) {
+        let mut payload = Vec::new();
+        for &v in values {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        write_len_field(buf, field, &payload);
+    }
+
+    /// 构造 bytes 字段（field, wt=2）
+    fn write_bytes_field(buf: &mut Vec<u8>, field: u32, data: &[u8]) {
+        write_len_field(buf, field, data);
+    }
+
+    /// 构造 TensorProto（FLOAT，raw_data 形式）
+    fn build_tensor_float_raw(name: &str, dims: &[i64], values: &[f32]) -> Vec<u8> {
+        let mut t = Vec::new();
+        write_packed_int64_field(&mut t, 1, dims); // dims
+        write_varint_field(&mut t, 2, 1); // data_type = 1 (FLOAT)
+        write_string_field(&mut t, 8, name); // name
+        let mut raw = Vec::new();
+        for &v in values {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        write_bytes_field(&mut t, 9, &raw); // raw_data
+        t
+    }
+
+    /// 构造 TensorProto（FLOAT，float_data packed 形式，无 raw_data）
+    fn build_tensor_float_data(name: &str, dims: &[i64], values: &[f32]) -> Vec<u8> {
+        let mut t = Vec::new();
+        write_packed_int64_field(&mut t, 1, dims); // dims
+        write_varint_field(&mut t, 2, 1); // data_type = 1 (FLOAT)
+        write_string_field(&mut t, 8, name); // name
+        write_packed_float_field(&mut t, 4, values); // float_data
+        t
+    }
+
+    /// 构造 TensorProto（INT32，raw_data 形式 —— 非 FLOAT，应退化处理）
+    fn build_tensor_int32(name: &str, dims: &[i64], values: &[i32]) -> Vec<u8> {
+        let mut t = Vec::new();
+        write_packed_int64_field(&mut t, 1, dims); // dims
+        write_varint_field(&mut t, 2, 6); // data_type = 6 (INT32)
+        write_string_field(&mut t, 8, name); // name
+        let mut raw = Vec::new();
+        for &v in values {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        write_bytes_field(&mut t, 9, &raw); // raw_data
+        t
+    }
+
+    /// 读取节点 Value=FloatArray 数据
+    fn read_value_float_array(g: &Graph, nid: base::NodeId) -> Option<Vec<f64>> {
+        for e in g.node(nid).ok()?.attrs() {
+            if e.key == base::StorageAttrKey::Value as u8
+                && e.tag == base::storage::AttrTag::FloatArray as u8
+            {
+                return Some(g.node(nid).unwrap().storage.attr_float_array(e).to_vec());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn parses_initializer_float_raw_data() {
+        // initializer "w" shape [2,3]，raw_data = 6 个 f32
+        let vals = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let tensor = build_tensor_float_raw("w", &[2, 3], &vals);
+        let graph = {
+            let mut g = Vec::new();
+            write_len_field(&mut g, 5, &tensor); // initializer
+            g
+        };
+        let mut buf = Vec::new();
+        write_len_field(&mut buf, 7, &graph);
+        let g = parse(&buf).unwrap();
+        // 应有 1 个 Constant 节点
+        let consts: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Constant)
+            .collect();
+        assert_eq!(consts.len(), 1, "FLOAT initializer 应映射成 Constant 节点");
+        let n = g.node(consts[0]).unwrap();
+        // 输出 value shape 应为 [2,3]
+        let out = n.outputs()[0];
+        assert_eq!(
+            g.value(out).unwrap().shape(),
+            &[2, 3],
+            "shape 应为 dims [2,3]"
+        );
+        // Value=FloatArray 数据应匹配
+        let data = read_value_float_array(&g, consts[0]).expect("应有 FloatArray Value");
+        assert_eq!(data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn parses_initializer_scalar_constant_value() {
+        // 单元素 FLOAT initializer shape [1] value=2.5
+        // → Value=Float（标量），constant_value() 应返回 2.5
+        let tensor = build_tensor_float_raw("c", &[1], &[2.5f32]);
+        let graph = {
+            let mut g = Vec::new();
+            write_len_field(&mut g, 5, &tensor);
+            g
+        };
+        let mut buf = Vec::new();
+        write_len_field(&mut buf, 7, &graph);
+        let g = parse(&buf).unwrap();
+        let consts: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Constant)
+            .collect();
+        assert_eq!(consts.len(), 1);
+        let cv = g.node(consts[0]).unwrap().constant_value();
+        assert_eq!(cv, Some(2.5), "单元素张量应能通过 constant_value() 取值");
+    }
+
+    #[test]
+    fn parses_initializer_float_data_packed() {
+        // float_data（packed）形式，无 raw_data
+        let vals = [0.5f32, 1.5, 2.5, 3.5];
+        let tensor = build_tensor_float_data("b", &[4], &vals);
+        let graph = {
+            let mut g = Vec::new();
+            write_len_field(&mut g, 5, &tensor);
+            g
+        };
+        let mut buf = Vec::new();
+        write_len_field(&mut buf, 7, &graph);
+        let g = parse(&buf).unwrap();
+        let consts: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Constant)
+            .collect();
+        assert_eq!(consts.len(), 1);
+        let data = read_value_float_array(&g, consts[0]).expect("应有 FloatArray");
+        assert_eq!(data, vec![0.5, 1.5, 2.5, 3.5]);
+        assert_eq!(
+            g.node(consts[0]).unwrap().outputs().len(),
+            1,
+            "应有 1 个输出"
+        );
+    }
+
+    #[test]
+    fn parses_initializer_non_float_degrades() {
+        // INT32 initializer（data_type=6）应退化成未知 shape 输入，不建 Constant
+        let tensor = build_tensor_int32("idx", &[3], &[1, 2, 3]);
+        let graph = {
+            let mut g = Vec::new();
+            write_len_field(&mut g, 5, &tensor);
+            g
+        };
+        let mut buf = Vec::new();
+        write_len_field(&mut buf, 7, &graph);
+        let g = parse(&buf).unwrap();
+        // 不应有 Constant 节点
+        let consts: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Constant)
+            .collect();
+        assert!(consts.is_empty(), "INT32 initializer 不应建 Constant 节点");
+        // 但 value 应已注册（node 数为 0，inputs 也为 0，但 value 表里应有）
+        // 这里间接验证：不 panic 即可
+    }
+
+    #[test]
+    fn initializer_value_is_usable_by_node() {
+        // initializer "one" shape [1] value=1.0 + 节点 Mul(x, one) → y
+        // 验证 initializer 的 value 能被节点 input 引用
+        let tensor = build_tensor_float_raw("one", &[1], &[1.0f32]);
+        let node = {
+            let mut n = Vec::new();
+            write_string_field(&mut n, 1, "x"); // input
+            write_string_field(&mut n, 1, "one"); // input（initializer）
+            write_string_field(&mut n, 2, "y"); // output
+            write_string_field(&mut n, 3, "Mul"); // op_type
+            n
+        };
+        let vi_x = {
+            let mut v = Vec::new();
+            write_string_field(&mut v, 1, "x");
+            v
+        };
+        let vi_y = {
+            let mut v = Vec::new();
+            write_string_field(&mut v, 1, "y");
+            v
+        };
+        let graph = {
+            let mut g = Vec::new();
+            write_len_field(&mut g, 1, &node); // node
+            write_len_field(&mut g, 5, &tensor); // initializer
+            write_len_field(&mut g, 11, &vi_x); // input
+            write_len_field(&mut g, 12, &vi_y); // output
+            g
+        };
+        let mut buf = Vec::new();
+        write_len_field(&mut buf, 7, &graph);
+        let g = parse(&buf).unwrap();
+        // Mul 节点的 inputs 应包含 Constant 的输出 value（非 u32::MAX）
+        let mul: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Mul)
+            .collect();
+        assert_eq!(mul.len(), 1);
+        let ins = g.node(mul[0]).unwrap().inputs();
+        assert_eq!(ins.len(), 2);
+        // 第二个 input 应是 Constant 输出（不是 u32::MAX 占位）
+        assert_ne!(ins[1], u32::MAX, "initializer value 应被节点引用");
+        // 该 value 的定义节点应是 Constant
+        let def = g.value(ins[1]).unwrap().def_node();
+        assert_eq!(
+            g.node(def).unwrap().kind,
+            OpKind::Constant,
+            "Mul 的第二个 input 应定义在 Constant 节点"
+        );
+        // 且 constant_value 应为 1.0
+        assert_eq!(g.node(def).unwrap().constant_value(), Some(1.0));
     }
 }

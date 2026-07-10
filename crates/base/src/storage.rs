@@ -411,6 +411,20 @@ impl StorageGraph {
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i64, count) }
     }
 
+    /// 读取属性 float array（每个元素 8 字节 LE f64）。
+    ///
+    /// # Safety
+    /// 同 `attr_int_array`，强转 &[f64] 需对齐 8。
+    #[inline]
+    pub fn attr_float_array(&self, entry: &AttrEntry) -> &[f64] {
+        debug_assert_eq!(entry.tag, AttrTag::FloatArray as u8);
+        let start = entry.data_off as usize;
+        let end = start + entry.data_len as usize;
+        let bytes = &self.attr_data[start..end];
+        let count = bytes.len() / 8;
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, count) }
+    }
+
     #[inline]
     pub fn value_shape(&self, value: u32) -> &[i64] {
         let h = &self.value_hdr[value as usize];
