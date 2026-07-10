@@ -12,6 +12,7 @@
 //! 3. **融合**（[`fuse`]）：基于 cost model 的多对一启发式融合
 
 pub mod algebra;
+pub mod constprop;
 pub mod cost_model;
 pub mod cse;
 pub mod decompose;
@@ -41,7 +42,9 @@ impl PassManager {
         let mut pm = Self::new();
         pm.add(Box::new(passes::Verify));
         pm.add(Box::new(DecomposePass));
+        pm.add(Box::new(ConstPropPass));
         pm.add(Box::new(AlgebraPass));
+        pm.add(Box::new(ConstPropPass));
         pm.add(Box::new(FloatOptPass));
         pm.add(Box::new(CsePass));
         pm.add(Box::new(passes::DeadCodeElim));
@@ -80,6 +83,22 @@ impl Pass for DecomposePass {
         let results = decompose::run_decompose(graph)?;
         ctx.inc("decompose_count");
         let _ = results;
+        Ok(())
+    }
+}
+
+struct ConstPropPass;
+
+impl Pass for ConstPropPass {
+    fn name(&self) -> &str {
+        "constprop"
+    }
+    fn run(&mut self, graph: &mut Graph, ctx: &mut PassContext) -> Result<()> {
+        let count = constprop::apply_constprop(graph)?;
+        if count > 0 {
+            ctx.inc("constprop_applied");
+            ctx.stats.insert("constprop_count".into(), count);
+        }
         Ok(())
     }
 }
