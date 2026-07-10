@@ -61,6 +61,12 @@ pub fn default_rules() -> Vec<Rule> {
         r#"(rule (when (= op "reduce_sum"))  (emit "rsum"  "x" "axis"))"#,
         r#"(rule (when (= op "reduce_mean")) (emit "rmean" "x" "axis"))"#,
         r#"(rule (when (= op "reduce_max"))  (emit "rmax"  "x" "axis"))"#,
+        // 数据移动（无 FLOPs，仅布局/形状调整）
+        r#"(rule (when (= op "reshape"))   (emit "reshape" "x"))"#,
+        r#"(rule (when (= op "transpose")) (emit "transpose" "x"))"#,
+        r#"(rule (when (= op "concat"))    (emit "concat" "x"))"#,
+        r#"(rule (when (= op "slice"))     (emit "slice" "x"))"#,
+        r#"(rule (when (= op "pool"))      (emit "pool" "x"))"#,
         // 复合（未拆细时直发）
         r#"(rule (when (= op "softmax"))    (emit "sm"    "x"))"#,
         r#"(rule (when (= op "layer_norm")) (emit "ln"    "x" "g" "b"))"#,

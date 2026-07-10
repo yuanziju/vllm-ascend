@@ -28,6 +28,12 @@ pub fn lower(graph: &Graph, _target: common::Target) -> Result<ArchGraph> {
             OpKind::ReduceSum => "reduce_sum",
             OpKind::ReduceMean => "reduce_mean",
             OpKind::ReduceMax => "reduce_max",
+            // 数据移动（无 FLOPs，仅布局/形状调整）
+            OpKind::Reshape => "reshape",
+            OpKind::Transpose => "transpose",
+            OpKind::Concat => "concat",
+            OpKind::Slice => "slice",
+            OpKind::Pool => "pool",
             OpKind::Constant => "const",
             OpKind::Placeholder => "load",
             OpKind::Return => "store",
