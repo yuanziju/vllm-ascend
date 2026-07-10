@@ -41,12 +41,8 @@ pub fn lower(graph: &Graph, _target: common::Target) -> Result<ArchGraph> {
             OpKind::Fused => "fused",
             // Custom：未知 ONNX 算子（attr 记原始 op_type 字符码），透传 op 名
             OpKind::Custom => "custom",
-            other => {
-                return Err(base::NeutronError::Backend(format!(
-                    "lowering 未覆盖: {:?}",
-                    other
-                )))
-            }
+            // 所有 OpKind 变体已显式覆盖；新增 op 时编译器会因 non-exhaustive 报错，
+            // 强制在此补 lowering 分支——比 catch-all 更安全（不会静默漏）
         };
         ag.add(ArchOp::KernelCall(native.to_string()));
     }
