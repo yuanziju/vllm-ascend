@@ -11,7 +11,8 @@
 //! - **MatMul**：取第一个输入的行 × 第二个输入的列
 //! - **Reshape**：输出 shape = attr Shape（IntArray）
 //! - **Transpose**：输出 shape = 输入 shape 按 perm 重排
-//! - 其余 op（Concat 等）保守不动
+//! - **Concat**：沿 axis 拼接，输出 shape = 各输入 shape 在 axis 维求和，其余维相等
+//! - 其余 op 保守不动
 //!
 //! 未知标记：shape 含 -1 表示该维未知。广播时 -1 维向已知维靠拢。
 
@@ -167,6 +168,45 @@ fn infer_shape(graph: &Graph, node_id: NodeId) -> Result<Option<Vec<i64>>> {
                 }
                 None => return Ok(None),
             }
+        }
+        // Concat：沿 axis 拼接，输出 shape = 各输入 shape 在 axis 维求和，其余维相等
+        OpKind::Concat => {
+            if ins.is_empty() {
+                return Ok(None);
+            }
+            // 收集所有输入 shape，要求全部已知
+            let mut shapes: Vec<Vec<i64>> = Vec::with_capacity(ins.len());
+            for &vin in ins {
+                let s = graph.value(vin)?.shape().to_vec();
+                if s.is_empty() || !shape_known(&s) {
+                    return Ok(None);
+                }
+                shapes.push(s);
+            }
+            let axis = read_axis(graph, node_id)?;
+            let first = &shapes[0];
+            let rank = first.len();
+            let ax = if axis < 0 { axis + rank as i64 } else { axis };
+            if ax < 0 || ax as usize >= rank {
+                return Ok(None);
+            }
+            // 各输入 rank 相同，且非 axis 维相等；axis 维求和
+            let mut sum_axis = first[ax as usize];
+            for s in &shapes[1..] {
+                if s.len() != rank {
+                    return Ok(None);
+                }
+                for i in 0..rank {
+                    if i as i64 == ax {
+                        sum_axis += s[i];
+                    } else if s[i] != first[i] {
+                        return Ok(None);
+                    }
+                }
+            }
+            let mut out = first.clone();
+            out[ax as usize] = sum_axis;
+            out
         }
         // 其余 op 保守不动
         _ => return Ok(None),
@@ -384,5 +424,43 @@ mod tests {
         apply_shape_infer(&mut g).unwrap();
         let s = g.value(out).unwrap().shape();
         assert_eq!(s, &[3, 2], "Transpose perm=[1,0] 把 [2,3] 重排为 [3,2]");
+    }
+
+    #[test]
+    fn infers_concat_along_axis() {
+        let mut g = Graph::new("test");
+        // 三个输入 [2,3] [2,5] [2,4] 沿 axis=1 拼接 → [2,12]
+        let a = g.add_input(tensor(vec![2, 3]), Some("a"));
+        let b = g.add_input(tensor(vec![2, 5]), Some("b"));
+        let c = g.add_input(tensor(vec![2, 4]), Some("c"));
+        let cat = g.add_node(OpKind::Concat);
+        let out = g.add_value(tensor(vec![-1, -1]), Some("o"), cat);
+        g.storage.set_node_inputs(cat, &[a, b, c]);
+        g.storage.set_node_outputs(cat, &[out]);
+        g.storage.add_attr_int(cat, StorageAttrKey::Axis, 1);
+        g.mark_output(out);
+
+        apply_shape_infer(&mut g).unwrap();
+        let s = g.value(out).unwrap().shape();
+        assert_eq!(s, &[2, 12], "Concat axis=1 [2,3]+[2,5]+[2,4] → [2,12]");
+    }
+
+    #[test]
+    fn concat_non_matching_dims_not_inferred() {
+        let mut g = Graph::new("test");
+        // 非轴维不匹配：[2,3] + [4,5] axis=1 → 第二维可拼接但第一维不等，应保守不推
+        let a = g.add_input(tensor(vec![2, 3]), Some("a"));
+        let b = g.add_input(tensor(vec![4, 5]), Some("b"));
+        let cat = g.add_node(OpKind::Concat);
+        let out = g.add_value(tensor(vec![-1, -1]), Some("o"), cat);
+        g.storage.set_node_inputs(cat, &[a, b]);
+        g.storage.set_node_outputs(cat, &[out]);
+        g.storage.add_attr_int(cat, StorageAttrKey::Axis, 1);
+        g.mark_output(out);
+
+        apply_shape_infer(&mut g).unwrap();
+        // 非轴维不匹配，应保留 [-1,-1] 不推
+        let s = g.value(out).unwrap().shape();
+        assert_eq!(s, &[-1i64, -1], "非轴维不匹配时应保守不推");
     }
 }
