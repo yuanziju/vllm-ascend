@@ -5,7 +5,7 @@
 //! 估算准确（否则 value_bytes 会退化成 1）。
 //!
 //! 推断规则（保守，遇到未知或无法确定的就保留原 shape）：
-//! - **elementwise**（Add/Sub/Mul/Div/Relu/Gelu/Sigmoid/Tanh/Sqrt/Exp/Pow）：
+//! - **elementwise**（Add/Sub/Mul/Div/Relu/Gelu/Sigmoid/Tanh/Sqrt/Rsqrt/Exp/Pow）：
 //!   单输入取输入 shape；双输入取广播结果 shape
 //! - **reduce**（ReduceSum/ReduceMean/ReduceMax）：沿 axis 消去一维
 //! - **MatMul**：取第一个输入的行 × 第二个输入的列
@@ -62,6 +62,7 @@ fn infer_shape(graph: &Graph, node_id: NodeId) -> Result<Option<Vec<i64>>> {
         | OpKind::Sigmoid
         | OpKind::Tanh
         | OpKind::Sqrt
+        | OpKind::Rsqrt
         | OpKind::Exp => {
             if ins.is_empty() {
                 return Ok(None);

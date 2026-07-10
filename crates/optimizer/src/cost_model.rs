@@ -74,6 +74,8 @@ pub fn estimate_op(graph: &Graph, node: NodeView) -> Result<OpCost> {
         OpKind::Gelu => (out_bytes / 4.0 * 8.0, 1.0),
         OpKind::Sigmoid => (out_bytes / 4.0 * 4.0, 1.0),
         OpKind::Tanh => (out_bytes / 4.0 * 6.0, 1.0),
+        // Rsqrt：1/sqrt(x) 单 op，常硬件单指令或 0x5f3759df 位 trick，比 Sqrt+Div 便宜
+        OpKind::Rsqrt => (out_bytes / 4.0 * 2.0, 1.0),
         OpKind::Softmax => (out_bytes / 4.0 * 12.0, 1.0),
         OpKind::MatMul => {
             // [m,k] × [k,n] → [m,n]，FLOPs = 2·m·n·k（需双输入 shape 已知）

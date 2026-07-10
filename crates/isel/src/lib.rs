@@ -53,6 +53,7 @@ pub fn default_rules() -> Vec<Rule> {
         r#"(rule (when (= op "tanh"))   (emit "tanh"  "x"))"#,
         // 超越函数
         r#"(rule (when (= op "sqrt"))   (emit "sqrt"  "x"))"#,
+        r#"(rule (when (= op "rsqrt"))  (emit "rsqrt" "x"))"#,
         r#"(rule (when (= op "exp"))    (emit "exp"   "x"))"#,
         r#"(rule (when (= op "pow"))    (emit "pow"   "x" "y"))"#,
         // reduce

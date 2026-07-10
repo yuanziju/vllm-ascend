@@ -58,6 +58,9 @@ pub fn find_opportunities(graph: &Graph, coeffs: CostCoeffs) -> Result<Vec<Fusio
 }
 
 fn is_elementwise(kind: OpKind) -> bool {
+    // 注意：Rsqrt 故意不在此列——它作为融合边界保留为独立 op，
+    // 让 lowering 能发专用 rsqrt kernel（0x5f3759df 位 trick），
+    // 而非被融进 elementwise 链变成 Custom 节点
     matches!(
         kind,
         OpKind::Add

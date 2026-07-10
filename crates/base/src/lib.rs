@@ -174,6 +174,10 @@ pub enum OpKind {
     ReduceMean = 24,
     /// ReduceMax：沿指定轴取最大值（attr Axis 记录轴）。decompose Softmax 数值稳定需要
     ReduceMax = 25,
+    /// Rsqrt：1/sqrt(x) 单 op。由 float_opts 的 FastInvSqrt 把 `Div(a, Sqrt(b))` 浮点结构
+    /// 融合而来（`a/√b = a·b^(-1/2)`）。后端 lowering 可用 0x5f3759df 魔数 bit trick 实现
+    /// （Quake III fast inverse sqrt）。RMSNorm / LayerNorm 等 normalization 到处出现
+    Rsqrt = 26,
     Custom = 64,
 }
 
@@ -206,6 +210,7 @@ impl OpKind {
             23 => Ok(Self::ReduceSum),
             24 => Ok(Self::ReduceMean),
             25 => Ok(Self::ReduceMax),
+            26 => Ok(Self::Rsqrt),
             64 => Ok(Self::Custom),
             _ => Err(NeutronError::Ir(format!("未知 op tag: {}", v))),
         }
