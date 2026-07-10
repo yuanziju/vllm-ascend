@@ -34,6 +34,9 @@ pub fn simplify(graph: &Graph, node: NodeView, cfg: AlgebraConfig) -> Result<Sim
         OpKind::Sub => simplify_sub(graph, node, cfg),
         OpKind::Mul => simplify_mul(graph, node),
         OpKind::Div => simplify_div(graph, node, cfg),
+        OpKind::Sqrt => simplify_sqrt(graph, node),
+        OpKind::Exp => simplify_exp(graph, node),
+        OpKind::Pow => simplify_pow(graph, node),
         OpKind::Reshape => simplify_reshape(graph, node),
         OpKind::Transpose => simplify_transpose(graph, node),
         _ => Ok(SimplifyResult::NoChange),
@@ -129,6 +132,50 @@ fn simplify_div(graph: &Graph, node: NodeView, cfg: AlgebraConfig) -> Result<Sim
     // x / x = 1 (NaN 风险：0/0=NaN, Inf/Inf=NaN。默认禁用)
     if cfg.unsafe_opts && a == b {
         return Ok(SimplifyResult::FoldToConstant(1.0));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+// --- 一元常量折叠（Sqrt/Exp/Pow 输入为常量时直接算出结果） ---
+
+fn simplify_sqrt(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    let ins = node.inputs();
+    if ins.len() != 1 {
+        return Ok(SimplifyResult::NoChange);
+    }
+    // sqrt(c) = c.sqrt()（c<0 时返回 NaN，与运行时语义一致）
+    if let Some(c) = constant_value(graph, ins[0])? {
+        return Ok(SimplifyResult::FoldToConstant(c.sqrt()));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+fn simplify_exp(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    let ins = node.inputs();
+    if ins.len() != 1 {
+        return Ok(SimplifyResult::NoChange);
+    }
+    if let Some(c) = constant_value(graph, ins[0])? {
+        return Ok(SimplifyResult::FoldToConstant(c.exp()));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+fn simplify_pow(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    let ins = node.inputs();
+    if ins.len() != 2 {
+        return Ok(SimplifyResult::NoChange);
+    }
+    // pow(c1, c2) = c1.powf(c2)（负底数+非整指数返回 NaN，与运行时一致）
+    if let (Some(base), Some(exp)) = (
+        constant_value(graph, ins[0])?,
+        constant_value(graph, ins[1])?,
+    ) {
+        return Ok(SimplifyResult::FoldToConstant(base.powf(exp)));
+    }
+    // x ^ 1 = x
+    if is_constant_one(graph, ins[1])? {
+        return Ok(SimplifyResult::ReplaceWith(ins[0]));
     }
     Ok(SimplifyResult::NoChange)
 }
@@ -528,6 +575,87 @@ mod tests {
             .add_attr_int_array(tr, base::StorageAttrKey::Perm, &[1, 0]);
         g.mark_output(out);
         // perm 非单位排列，不应消除
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // --- 一元常量折叠测试 ---
+
+    #[test]
+    fn sqrt_constant_folds() {
+        let mut g = Graph::new("test");
+        let (_c, a) = g.add_constant_f64(9.0);
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[a]);
+        g.storage.set_node_outputs(sqrt, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let out_v = g.outputs()[0];
+        let def = g.value(out_v).unwrap().def_node();
+        assert_eq!(g.node(def).unwrap().constant_value(), Some(3.0));
+    }
+
+    #[test]
+    fn exp_constant_folds() {
+        let mut g = Graph::new("test");
+        let (_c, a) = g.add_constant_f64(0.0);
+        let exp = g.add_node(OpKind::Exp);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), exp);
+        g.storage.set_node_inputs(exp, &[a]);
+        g.storage.set_node_outputs(exp, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let out_v = g.outputs()[0];
+        let def = g.value(out_v).unwrap().def_node();
+        assert_eq!(g.node(def).unwrap().constant_value(), Some(1.0));
+    }
+
+    #[test]
+    fn pow_two_constants_fold() {
+        let mut g = Graph::new("test");
+        let (_c1, base) = g.add_constant_f64(2.0);
+        let (_c2, exp) = g.add_constant_f64(10.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[base, exp]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let out_v = g.outputs()[0];
+        let def = g.value(out_v).unwrap().def_node();
+        assert_eq!(g.node(def).unwrap().constant_value(), Some(1024.0));
+    }
+
+    #[test]
+    fn pow_x_to_one_replaced_with_x() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, one) = g.add_constant_f64(1.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, one]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // x^1 = x，输出应直接指向 x
+        assert_eq!(g.outputs(), &[x]);
+    }
+
+    #[test]
+    fn sqrt_non_constant_not_folded() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[x]);
+        g.storage.set_node_outputs(sqrt, &[out]);
+        g.mark_output(out);
+        // 输入非常量，不应折叠
         let count = run_algebraic_simplify(&mut g).unwrap();
         assert_eq!(count, 0);
     }
