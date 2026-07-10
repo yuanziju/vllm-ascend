@@ -235,9 +235,9 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 
 ### 2026-07-10 — 底层存储重命名 + 多 pass 充实 + frontend 属性解析（feat/neutron-a7e3c902）
 
-**当前状态**：本轮一小时连做 7 件事，全部提交，回归全绿。底层存储模块避嫌重命名完成；algebra/fuse/shape_infer 三 pass 充实；frontend ONNX 属性解析打通到 decompose 并有端到端测试。本分支待合并回 main。
+**当前状态**：本轮一小时连做 8 件事，全部提交，回归全绿。底层存储模块避嫌重命名完成；algebra/fuse/shape_infer/cost_model 四 pass 充实；frontend ONNX 属性解析打通到 decompose 并有端到端测试。已合并回 main。
 
-**已完成**（7 commit，按时序）：
+**已完成**（8 commit，按时序）：
 - **底层存储模块避嫌重命名 raw→storage**（commit 0013728）：12 文件全量替换（RawGraph→StorageGraph、.raw→.storage、raw::→storage::、RawAttrKey→StorageAttrKey 等），git 识别为 rename。仅保留 std API `from_raw_parts`（非自有命名）。这是上轮明确推迟的"大改动单独一轮做"
 - **algebra 基于 shape 的 no-op 简化 + shape_infer Reshape/Transpose 推断**（commit 7727dce）：base 加 `AttrKey::Perm=12`（Transpose 轴排列，IntArray）。shape_infer 推 Reshape（输出=attr Shape）+ Transpose（输出=输入按 perm 重排）。algebra 加 simplify_reshape（输入输出 shape 相等→ReplaceWith input）+ simplify_transpose（perm 单位排列→ReplaceWith input）。新增 `read_int_array_attr` 通用辅助。6 新单测
 - **fuse reduce + unary elementwise 融合**（commit 75513c2）：新增 `is_reduce` 辅助；重写 `build_fusion_chain`，链头允许一个 reduce（仅 unary elementwise 才接，reduce 是 shape 分界点不再往前扩）；apply_fusion 复制 reduce 的 Axis attr 到融合节点保留轴信息。2 新单测
@@ -245,12 +245,13 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 - **interface 端到端测试**（commit 25c9a4f）：构造含 LayerNormalization(x,gamma,beta,epsilon=1e-3) 的 ONNX 字节流，验证前端解析后 epsilon≈1e-3 写入 Epsilon attr，单独跑 decompose 后 LayerNorm 拆成原语子图（ReduceMean/Sub/Sqrt/Div/Mul/Add 齐全）。隔离跑 decompose 避免被 fusion 干扰。证明整条链路：ONNX protobuf 属性解码 → StorageAttrKey 写入 → decompose 的 read_epsilon 消费
 - **algebra 一元常量折叠 Sqrt/Exp/Pow**（commit 22a76a7）：复用 FoldToConstant 机制，sqrt(c)→Constant(c.sqrt())、exp(c)→Constant(c.exp())、pow(c1,c2)→Constant(c1.powf(c2))、pow(x,1)→x。负底数+非整指数 / 负数 sqrt 返回 NaN 与运行时一致。5 新单测
 - **shape_infer Concat 沿 axis 拼接推断**（commit 76d8a0c）：Concat 输出 shape = 各输入 shape 在 axis 维求和、其余维相等，要求全部已知 + rank 相同 + 非轴维相等；axis 支持负值。让 cost_model 对 Concat 后图估算准确。2 新单测
+- **cost_model MatMul FLOPs 用输入 shape 算 2·m·n·k**（commit c2f4a0e）：旧估计 n=(out_bytes/4).sqrt() 假设方阵，非方阵严重失准。shape_infer 现能填 MatMul 输入 shape，故读取双输入 [m,k]×[k,n] 算 FLOPs=2·m·n·k；shape 未知时退化到方阵估计（向后兼容）。新增 `matmul_flops` 辅助 + 3 新单测（方阵/非方阵/未知 shape 退化）
 
 **回归验证（全绿）**：
 - `cargo build --workspace`：0 warning
 - `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
 - `cargo fmt --all -- --check`：clean
-- `cargo test --workspace`：91 passed (base 3 + common 2 + frontend 18 + interface 2 + isel 12 + lisp 4 + optimizer 50)
+- `cargo test --workspace`：94 passed (base 3 + common 2 + frontend 18 + interface 2 + isel 12 + lisp 4 + optimizer 53)
 - CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
 
 **设计哲学遵守**：
@@ -263,9 +264,8 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 **避嫌规范延续**：本轮完成 raw→storage 重命名，文件名/类型名/注释/输出全部用"底层存储"等中性表述，不再用敏感词的中文翻译。
 
 **下一步**（优先级排序）：
-1. 合并 feat/neutron-a7e3c902 → main
-2. pt 前端：PyTorch 解析（当前占位，是 frontend 最后一块）
-3. fuse 可扩展：binary elementwise + reduce（当前只 unary elementwise 接 reduce）
-4. cost_model：MatMul 估算改进（当前 n=(out_bytes/4).sqrt() 假设方阵，应用输入 shape 算 m·n·k）
-5. isel：更多目标后端的规则覆盖（当前 21 个 native kernel）
-6. frontend：解析 ONNX initializer 的实际张量数据（当前只取 name，值留空）
+1. pt 前端：PyTorch 解析（当前占位，是 frontend 最后一块）
+2. fuse 可扩展：binary elementwise + reduce（当前只 unary elementwise 接 reduce）
+3. isel：更多目标后端的规则覆盖（当前 21 个 native kernel）
+4. frontend：解析 ONNX initializer 的实际张量数据（当前只取 name，值留空）
+5. algebra 扩展：常量传播跨节点（constprop 当前只做 value canonicalize）、shape 推断后基于 shape 的进一步简化（如广播后 x*ones→x）
