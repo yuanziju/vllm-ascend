@@ -384,6 +384,15 @@ impl RawGraph {
         &self.shape_data[h.shape_off as usize..(h.shape_off + h.rank as u32) as usize]
     }
 
+    /// 设置 value 的 shape（更新 rank + shape_off，追加到 shape_data 池）。
+    /// 用于 shape 推断 pass 回填未知 shape（rank/shape_off 可变）。
+    pub fn set_value_shape(&mut self, value: u32, dims: &[i64]) {
+        let new_off = self.add_shape(dims);
+        let h = &mut self.value_hdr[value as usize];
+        h.rank = dims.len() as u8;
+        h.shape_off = new_off;
+    }
+
     pub fn value_name(&self, value: u32) -> Option<&str> {
         let h = &self.value_hdr[value as usize];
         if h.name_off == u32::MAX {
