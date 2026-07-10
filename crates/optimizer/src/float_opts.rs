@@ -166,15 +166,15 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                         break;
                     }
                 }
-                graph.raw.set_node_inputs(div_node, &new_ins);
+                graph.storage.set_node_inputs(div_node, &new_ins);
                 // 改 op tag：Div(3) -> Mul(2)
-                graph.raw.node_hdr[div_node as usize].op_tag = OpKind::Mul as u8;
+                graph.storage.node_hdr[div_node as usize].op_tag = OpKind::Mul as u8;
                 applied += 1;
             }
             FloatOpt::MulByTwoToAdd { mul_node, x_input } => {
                 // 把 Mul 节点的 op 改成 Add，输入改成 [x, x]
-                graph.raw.set_node_inputs(mul_node, &[x_input, x_input]);
-                graph.raw.node_hdr[mul_node as usize].op_tag = OpKind::Add as u8;
+                graph.storage.set_node_inputs(mul_node, &[x_input, x_input]);
+                graph.storage.node_hdr[mul_node as usize].op_tag = OpKind::Add as u8;
                 applied += 1;
             }
             FloatOpt::FastInvSqrt { .. } | FloatOpt::SoftmaxOnline { .. } => {
@@ -198,8 +198,8 @@ mod tests {
         let (_c, two) = g.add_constant_f64(2.0);
         let div = g.add_node(OpKind::Div);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), div);
-        g.raw.set_node_inputs(div, &[x, two]);
-        g.raw.set_node_outputs(div, &[out]);
+        g.storage.set_node_inputs(div, &[x, two]);
+        g.storage.set_node_outputs(div, &[out]);
         g.mark_output(out);
 
         let count = apply_float_opts(&mut g).unwrap();
@@ -219,8 +219,8 @@ mod tests {
         let (_c, two) = g.add_constant_f64(2.0);
         let mul = g.add_node(OpKind::Mul);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), mul);
-        g.raw.set_node_inputs(mul, &[x, two]);
-        g.raw.set_node_outputs(mul, &[out]);
+        g.storage.set_node_inputs(mul, &[x, two]);
+        g.storage.set_node_outputs(mul, &[out]);
         g.mark_output(out);
 
         let count = apply_float_opts(&mut g).unwrap();
@@ -236,13 +236,13 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let sqrt = g.add_node(OpKind::Sqrt);
         let sqrt_out = g.add_value(Type::Scalar(DType::F32), Some("sx"), sqrt);
-        g.raw.set_node_inputs(sqrt, &[x]);
-        g.raw.set_node_outputs(sqrt, &[sqrt_out]);
+        g.storage.set_node_inputs(sqrt, &[x]);
+        g.storage.set_node_outputs(sqrt, &[sqrt_out]);
         let (_c, one) = g.add_constant_f64(1.0);
         let div = g.add_node(OpKind::Div);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), div);
-        g.raw.set_node_inputs(div, &[one, sqrt_out]);
-        g.raw.set_node_outputs(div, &[out]);
+        g.storage.set_node_inputs(div, &[one, sqrt_out]);
+        g.storage.set_node_outputs(div, &[out]);
         g.mark_output(out);
 
         let opts = find_opportunities(&g).unwrap();
@@ -259,8 +259,8 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let sm = g.add_node(OpKind::Softmax);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sm);
-        g.raw.set_node_inputs(sm, &[x]);
-        g.raw.set_node_outputs(sm, &[out]);
+        g.storage.set_node_inputs(sm, &[x]);
+        g.storage.set_node_outputs(sm, &[out]);
         g.mark_output(out);
 
         let opts = find_opportunities(&g).unwrap();
@@ -278,8 +278,8 @@ mod tests {
         let (_c, one) = g.add_constant_f64(1.0);
         let div = g.add_node(OpKind::Div);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), div);
-        g.raw.set_node_inputs(div, &[x, one]);
-        g.raw.set_node_outputs(div, &[out]);
+        g.storage.set_node_inputs(div, &[x, one]);
+        g.storage.set_node_outputs(div, &[out]);
         g.mark_output(out);
 
         // x/1 不应触发 DivByConstToMul（c=1 跳过，留给 algebra 的 x/1=x）

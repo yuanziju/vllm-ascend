@@ -232,3 +232,68 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 4. fuse 可扩展：reduce + elementwise 融合
 5. frontend：解析 ONNX 属性（axis/epsilon 等），喂给 decompose
 6. pt 前端：PyTorch 解析
+
+### 2026-07-10 — 底层存储重命名 + 多 pass 充实 + frontend 属性解析（feat/neutron-a7e3c902）
+
+**当前状态**：本轮一小时连做 8 件事，全部提交，回归全绿。底层存储模块避嫌重命名完成；algebra/fuse/shape_infer/cost_model 四 pass 充实；frontend ONNX 属性解析打通到 decompose 并有端到端测试。已合并回 main。
+
+**已完成**（8 commit，按时序）：
+- **底层存储模块避嫌重命名 raw→storage**（commit 0013728）：12 文件全量替换（RawGraph→StorageGraph、.raw→.storage、raw::→storage::、RawAttrKey→StorageAttrKey 等），git 识别为 rename。仅保留 std API `from_raw_parts`（非自有命名）。这是上轮明确推迟的"大改动单独一轮做"
+- **algebra 基于 shape 的 no-op 简化 + shape_infer Reshape/Transpose 推断**（commit 7727dce）：base 加 `AttrKey::Perm=12`（Transpose 轴排列，IntArray）。shape_infer 推 Reshape（输出=attr Shape）+ Transpose（输出=输入按 perm 重排）。algebra 加 simplify_reshape（输入输出 shape 相等→ReplaceWith input）+ simplify_transpose（perm 单位排列→ReplaceWith input）。新增 `read_int_array_attr` 通用辅助。6 新单测
+- **fuse reduce + unary elementwise 融合**（commit 75513c2）：新增 `is_reduce` 辅助；重写 `build_fusion_chain`，链头允许一个 reduce（仅 unary elementwise 才接，reduce 是 shape 分界点不再往前扩）；apply_fusion 复制 reduce 的 Axis attr 到融合节点保留轴信息。2 新单测
+- **frontend ONNX 属性解析**（commit ab9ca4a）：NodeProto.attribute (field 5) 原先跳过，现解析 AttributeProto（name(1)+type(3,跳过)+f(4,FIXED32)+i(5,varint)+ints(21,packed)），value 按 i/f/ints 存在性推断。按 op_type 映射到 StorageAttrKey：reduce/concat 的 axis/axes→Axis（axes 取首元素）、LayerNormalization 的 epsilon→Epsilon、Transpose 的 perm→Perm、Reshape 的 shape(attr)→Shape。5 新单测
+- **interface 端到端测试**（commit 25c9a4f）：构造含 LayerNormalization(x,gamma,beta,epsilon=1e-3) 的 ONNX 字节流，验证前端解析后 epsilon≈1e-3 写入 Epsilon attr，单独跑 decompose 后 LayerNorm 拆成原语子图（ReduceMean/Sub/Sqrt/Div/Mul/Add 齐全）。隔离跑 decompose 避免被 fusion 干扰。证明整条链路：ONNX protobuf 属性解码 → StorageAttrKey 写入 → decompose 的 read_epsilon 消费
+- **algebra 一元常量折叠 Sqrt/Exp/Pow**（commit 22a76a7）：复用 FoldToConstant 机制，sqrt(c)→Constant(c.sqrt())、exp(c)→Constant(c.exp())、pow(c1,c2)→Constant(c1.powf(c2))、pow(x,1)→x。负底数+非整指数 / 负数 sqrt 返回 NaN 与运行时一致。5 新单测
+- **shape_infer Concat 沿 axis 拼接推断**（commit 76d8a0c）：Concat 输出 shape = 各输入 shape 在 axis 维求和、其余维相等，要求全部已知 + rank 相同 + 非轴维相等；axis 支持负值。让 cost_model 对 Concat 后图估算准确。2 新单测
+- **cost_model MatMul FLOPs 用输入 shape 算 2·m·n·k**（commit c2f4a0e）：旧估计 n=(out_bytes/4).sqrt() 假设方阵，非方阵严重失准。shape_infer 现能填 MatMul 输入 shape，故读取双输入 [m,k]×[k,n] 算 FLOPs=2·m·n·k；shape 未知时退化到方阵估计（向后兼容）。新增 `matmul_flops` 辅助 + 3 新单测（方阵/非方阵/未知 shape 退化）
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：94 passed (base 3 + common 2 + frontend 18 + interface 2 + isel 12 + lisp 4 + optimizer 53)
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
+
+**设计哲学遵守**：
+- 重命名是用户上轮明确的"大改动单独一轮做"，本轮完成，纯机械替换不改语义
+- algebra 一元常量折叠是"常量折叠"的自然扩展（基础优化，非模式匹配），复用已有 FoldToConstant 机制
+- fuse reduce+elementwise 是通用融合（reduce 作 shape 分界点链头），非 MatMul+Add→Linear 贪心模式
+- shape_infer Concat 让 cost_model 估算准确（符合"cost model 现在就做"），保守策略（不满足条件就不推，避免错误 shape 被锁定）
+- frontend 属性解析不引 prost 重依赖，手写 protobuf 解码；未知属性静默忽略（前向兼容）
+
+**避嫌规范延续**：本轮完成 raw→storage 重命名，文件名/类型名/注释/输出全部用"底层存储"等中性表述，不再用敏感词的中文翻译。
+
+**下一步**（优先级排序）：
+1. pt 前端：PyTorch 解析（当前占位，是 frontend 最后一块）
+2. fuse 可扩展：binary elementwise + reduce（当前只 unary elementwise 接 reduce）
+3. isel：更多目标后端的规则覆盖（当前 21 个 native kernel）
+4. frontend：解析 ONNX initializer 的实际张量数据（当前只取 name，值留空）
+5. algebra 扩展：常量传播跨节点（constprop 当前只做 value canonicalize）、shape 推断后基于 shape 的进一步简化（如广播后 x*ones→x）
+
+### 2026-07-10 — initializer 张量解析 + fuse side inputs + algebra shape 简化（feat/neutron-init-fuse-shape）
+
+**当前状态**：本轮一小时连做 3 件事，全部提交，回归全绿。frontend ONNX initializer 张量数据完整解析映射成 Constant 节点；fuse 支持带 side inputs 的 binary elementwise 融合；algebra 识别多元素全 0/全 1 张量做 shape-based 简化。本分支待合并回 main。
+
+**已完成**（3 commit，按时序）：
+- **frontend ONNX initializer 张量数据解析**（commit 09f6ed6）：TensorProto 完整解析（dims/data_type/raw_data/float_data/double_data），FLOAT(1)/DOUBLE(11) 张量映射成 Constant 节点带 Value attr（单元素 Float 让 constant_value() 立即可用，多元素 FloatArray 让 constant_tensor() 可读）+ 输出 value 带真实 dims shape。其余 dtype 退化成未知 shape 输入。base 新增 `attr_float_array` 读取器 + `constant_tensor()` 返回完整 FloatArray + `constant_value()` 扩展支持单元素 FloatArray。**关键 bug 修复**：initializer 的 Constant 节点占用前面的 NodeId，第二遍填 inputs 不能用 `node_idx as u32`，改用 `node_ids: Vec<NodeId>` 记录真实 ID。5 新单测
+- **fuse binary elementwise + side inputs**（commit b71566b）：重写 `build_fusion_chain` 收集 side_inputs + side_positions，让 binary elementwise（Add/Sub/Mul/Div）的"另一输入"作为 side input 进融合节点而非被丢弃。diamond 检测（side input 由链中节点产生→放弃整条链）+ 自引用检测（add(r,r)→放弃）保证正确性。apply_fusion 加 consumed set 跳过与已应用链重叠的机会。融合后 inputs = 链头 inputs + side inputs；op 序列→Shape attr，side input 位置→Strides attr 供 lowering 重建。3 新单测
+- **algebra shape-based 简化**（commit b7f532a）：新增 `constant_is_uniform` 判断常量张量是否所有元素都等于 target，覆盖标量 Float / 单元素 FloatArray / 多元素 FloatArray 三种存储形式。这让 algebra 能识别 ONNX initializer 的 ones/zeros（多元素全 1/全 0 张量）。规则扩展：x+zeros→x、x*ones→x、x*zeros→复用那个 zeros 张量（ReplaceWith 保留 shape，不再退化为标量 FoldToConstant）。simplify_mul 的 x*0 分支从 FoldToConstant(0.0) 改为 ReplaceWith(那个0)，复用已有常量节点保留 shape；原 mul_zero_folds 测试仍兼容。4 新单测
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：106 passed (base 3 + common 2 + frontend 23 + interface 2 + isel 12 + lisp 4 + optimizer 60)
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
+
+**设计哲学遵守**：
+- initializer 解析打通"ONNX 张量数据 → Constant 节点 → algebra/float_opts 基于常量的优化"链路，之前 initializer 只取 name 退化成未知输入，Constant 没有真值导致基于常量的优化在 ONNX 输入上完全失效
+- fuse side inputs 是通用融合的正确性修复（旧实现把 binary 的另一输入丢弃是错的），diamond/自引用检测保证只融安全的情况，非贪心模式匹配
+- algebra shape-based 简化是"简单代数规则"的自然扩展（识别全 0/全 1 张量，不是复合算子模式），x*zeros 用 ReplaceWith 保留 shape 比 FoldToConstant 标量更准
+
+**下一步**（优先级排序）：
+1. pt 前端：PyTorch 解析（当前占位，是 frontend 最后一块）
+2. isel：更多目标后端的规则覆盖（当前 21 个 native kernel）
+3. algebra 常量传播跨节点（constprop 当前只做 value canonicalize）
+4. fuse 可扩展：reduce + elementwise 更复杂模式（当前 binary side inputs 已支持）
+5. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）

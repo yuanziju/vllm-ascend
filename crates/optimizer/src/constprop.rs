@@ -81,13 +81,13 @@ fn rewrite_value_uses(graph: &mut Graph, replacements: &HashMap<ValueId, ValueId
         let old_inputs: Vec<ValueId> = graph.node(nid).unwrap().inputs().to_vec();
         let new_inputs: Vec<ValueId> = old_inputs.iter().map(|&v| lookup(v)).collect();
         if old_inputs != new_inputs {
-            graph.raw.set_node_inputs(nid, &new_inputs);
+            graph.storage.set_node_inputs(nid, &new_inputs);
         }
     }
     let old_outputs: Vec<ValueId> = graph.outputs().to_vec();
     let new_outputs: Vec<ValueId> = old_outputs.iter().map(|&v| lookup(v)).collect();
     if old_outputs != new_outputs {
-        graph.raw.outputs = new_outputs;
+        graph.storage.outputs = new_outputs;
     }
 }
 
@@ -104,12 +104,12 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let add1 = g.add_node(OpKind::Add);
         let out1 = g.add_value(Type::Scalar(DType::F32), Some("o1"), add1);
-        g.raw.set_node_inputs(add1, &[x, a]);
-        g.raw.set_node_outputs(add1, &[out1]);
+        g.storage.set_node_inputs(add1, &[x, a]);
+        g.storage.set_node_outputs(add1, &[out1]);
         let add2 = g.add_node(OpKind::Add);
         let out2 = g.add_value(Type::Scalar(DType::F32), Some("o2"), add2);
-        g.raw.set_node_inputs(add2, &[x, b]);
-        g.raw.set_node_outputs(add2, &[out2]);
+        g.storage.set_node_inputs(add2, &[x, b]);
+        g.storage.set_node_outputs(add2, &[out2]);
         g.mark_output(out1);
         g.mark_output(out2);
 
@@ -130,8 +130,8 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let add = g.add_node(OpKind::Add);
         let out = g.add_value(Type::Scalar(DType::F32), Some("o"), add);
-        g.raw.set_node_inputs(add, &[x, a, b]);
-        g.raw.set_node_outputs(add, &[out]);
+        g.storage.set_node_inputs(add, &[x, a, b]);
+        g.storage.set_node_outputs(add, &[out]);
         g.mark_output(out);
 
         let result = run_constprop(&g).unwrap();
@@ -147,8 +147,8 @@ mod tests {
         let add = g.add_node(OpKind::Add);
         let out = g.add_value(Type::Scalar(DType::F32), Some("o"), add);
         // 用了 b（将被替换为 a）
-        g.raw.set_node_inputs(add, &[x, b]);
-        g.raw.set_node_outputs(add, &[out]);
+        g.storage.set_node_inputs(add, &[x, b]);
+        g.storage.set_node_outputs(add, &[out]);
         g.mark_output(out);
 
         let count = apply_constprop(&mut g).unwrap();
@@ -167,12 +167,12 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let add1 = g.add_node(OpKind::Add);
         let out1 = g.add_value(Type::Scalar(DType::F32), Some("o1"), add1);
-        g.raw.set_node_inputs(add1, &[x, a]);
-        g.raw.set_node_outputs(add1, &[out1]);
+        g.storage.set_node_inputs(add1, &[x, a]);
+        g.storage.set_node_outputs(add1, &[out1]);
         let add2 = g.add_node(OpKind::Add);
         let out2 = g.add_value(Type::Scalar(DType::F32), Some("o2"), add2);
-        g.raw.set_node_inputs(add2, &[x, b]);
-        g.raw.set_node_outputs(add2, &[out2]);
+        g.storage.set_node_inputs(add2, &[x, b]);
+        g.storage.set_node_outputs(add2, &[out2]);
         g.mark_output(out1);
         g.mark_output(out2);
 

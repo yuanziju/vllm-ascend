@@ -1,4 +1,4 @@
-//! raw — 底层图存储：连续 packed buffer + unsafe。
+//! storage — 底层图存储：连续 packed buffer + unsafe。
 //!
 //! 设计哲学：上层 [`crate::Graph`] 提供 Safe API，下层用巨量 unsafe 构建
 //! 丑陋但高效的王国。所有节点/值/属性压入连续 buffer，ID 即偏移量，O(1) 访问。
@@ -76,6 +76,8 @@ pub enum AttrKey {
     Shape = 10,
     /// Constant 节点的标量值（Float tag），用于代数折叠/识别 0/1
     Value = 11,
+    /// Transpose 的轴排列序列（IntArray tag），如 [1,0,2]
+    Perm = 12,
     Custom = 255,
 }
 
@@ -94,6 +96,7 @@ impl AttrKey {
             9 => Some(Self::Epsilon),
             10 => Some(Self::Shape),
             11 => Some(Self::Value),
+            12 => Some(Self::Perm),
             255 => Some(Self::Custom),
             _ => None,
         }
@@ -148,7 +151,7 @@ impl std::fmt::Debug for AttrEntry {
 
 /// 底层 packed 图存储
 #[derive(Default)]
-pub struct RawGraph {
+pub struct StorageGraph {
     pub node_hdr: Vec<NodeHeader>,
     pub value_hdr: Vec<ValueHeader>,
     pub edges: Vec<u32>,
@@ -161,9 +164,9 @@ pub struct RawGraph {
     pub outputs: Vec<u32>,
 }
 
-impl std::fmt::Debug for RawGraph {
+impl std::fmt::Debug for StorageGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RawGraph")
+        f.debug_struct("StorageGraph")
             .field("node_count", &self.node_hdr.len())
             .field("value_count", &self.value_hdr.len())
             .field("edge_count", &self.edges.len())
@@ -174,7 +177,7 @@ impl std::fmt::Debug for RawGraph {
     }
 }
 
-impl RawGraph {
+impl StorageGraph {
     pub fn new() -> Self {
         Self::default()
     }
@@ -406,6 +409,20 @@ impl RawGraph {
         let bytes = &self.attr_data[start..end];
         let count = bytes.len() / 8;
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i64, count) }
+    }
+
+    /// 读取属性 float array（每个元素 8 字节 LE f64）。
+    ///
+    /// # Safety
+    /// 同 `attr_int_array`，强转 &[f64] 需对齐 8。
+    #[inline]
+    pub fn attr_float_array(&self, entry: &AttrEntry) -> &[f64] {
+        debug_assert_eq!(entry.tag, AttrTag::FloatArray as u8);
+        let start = entry.data_off as usize;
+        let end = start + entry.data_len as usize;
+        let bytes = &self.attr_data[start..end];
+        let count = bytes.len() / 8;
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, count) }
     }
 
     #[inline]

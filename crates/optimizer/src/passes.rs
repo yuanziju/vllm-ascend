@@ -97,8 +97,8 @@ mod tests {
             Some("out0"),
             add,
         );
-        g.raw.set_node_inputs(add, &[in0, in0]);
-        g.raw.set_node_outputs(add, &[out0]);
+        g.storage.set_node_inputs(add, &[in0, in0]);
+        g.storage.set_node_outputs(add, &[out0]);
         g.mark_output(out0);
         let relu = g.add_node(OpKind::Relu);
         let dead_out = g.add_value(
@@ -109,8 +109,8 @@ mod tests {
             Some("dead"),
             relu,
         );
-        g.raw.set_node_inputs(relu, &[in1]);
-        g.raw.set_node_outputs(relu, &[dead_out]);
+        g.storage.set_node_inputs(relu, &[in1]);
+        g.storage.set_node_outputs(relu, &[dead_out]);
         g
     }
 

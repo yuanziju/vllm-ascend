@@ -15,7 +15,7 @@
 //!   c = sqrt(2/π) ≈ 0.7978845608; t = x + 0.044715*x³;
 //!   out = 0.5 * x * (1 + Tanh(c * t))
 
-use base::RawAttrKey;
+use base::StorageAttrKey;
 use base::{Graph, NodeId, NodeView, OpKind, Result, ValueId};
 use std::collections::HashSet;
 
@@ -71,8 +71,8 @@ pub fn run_decompose(graph: &mut Graph) -> Result<Vec<DecomposeResult>> {
 /// 读取节点的 Axis 属性（Int），默认 -1（最后一轴）
 fn read_axis(node: NodeView) -> i64 {
     for e in node.attrs() {
-        if e.key == RawAttrKey::Axis as u8 && e.tag == base::raw::AttrTag::Int as u8 {
-            return node.raw.attr_int(e);
+        if e.key == StorageAttrKey::Axis as u8 && e.tag == base::storage::AttrTag::Int as u8 {
+            return node.storage.attr_int(e);
         }
     }
     -1
@@ -81,8 +81,8 @@ fn read_axis(node: NodeView) -> i64 {
 /// 读取节点的 Epsilon 属性（Float），默认 1e-5
 fn read_epsilon(node: NodeView) -> f64 {
     for e in node.attrs() {
-        if e.key == RawAttrKey::Epsilon as u8 && e.tag == base::raw::AttrTag::Float as u8 {
-            return node.raw.attr_float(e);
+        if e.key == StorageAttrKey::Epsilon as u8 && e.tag == base::storage::AttrTag::Float as u8 {
+            return node.storage.attr_float(e);
         }
     }
     1e-5
@@ -102,9 +102,9 @@ fn build_reduce(
 ) -> Result<(NodeId, ValueId)> {
     let node = graph.add_node(kind);
     let out = graph.add_value(out_type, name, node);
-    graph.raw.set_node_inputs(node, &[in_v]);
-    graph.raw.set_node_outputs(node, &[out]);
-    graph.raw.add_attr_int(node, RawAttrKey::Axis, axis);
+    graph.storage.set_node_inputs(node, &[in_v]);
+    graph.storage.set_node_outputs(node, &[out]);
+    graph.storage.add_attr_int(node, StorageAttrKey::Axis, axis);
     Ok((node, out))
 }
 
@@ -119,8 +119,8 @@ fn build_binop(
 ) -> Result<(NodeId, ValueId)> {
     let node = graph.add_node(kind);
     let out = graph.add_value(out_type, name, node);
-    graph.raw.set_node_inputs(node, &[a, b]);
-    graph.raw.set_node_outputs(node, &[out]);
+    graph.storage.set_node_inputs(node, &[a, b]);
+    graph.storage.set_node_outputs(node, &[out]);
     Ok((node, out))
 }
 
@@ -134,8 +134,8 @@ fn build_unop(
 ) -> Result<(NodeId, ValueId)> {
     let node = graph.add_node(kind);
     let out = graph.add_value(out_type, name, node);
-    graph.raw.set_node_inputs(node, &[in_v]);
-    graph.raw.set_node_outputs(node, &[out]);
+    graph.storage.set_node_inputs(node, &[in_v]);
+    graph.storage.set_node_outputs(node, &[out]);
     Ok((node, out))
 }
 
@@ -431,7 +431,7 @@ fn rewrite_value_uses(graph: &mut Graph, old_values: &[ValueId], new_v: ValueId)
                 .iter()
                 .map(|&v| if is_old(v) { new_v } else { v })
                 .collect();
-            graph.raw.set_node_inputs(nid, &new_inputs);
+            graph.storage.set_node_inputs(nid, &new_inputs);
         }
     }
     let old_outputs: Vec<ValueId> = graph.outputs().to_vec();
@@ -441,7 +441,7 @@ fn rewrite_value_uses(graph: &mut Graph, old_values: &[ValueId], new_v: ValueId)
             .iter()
             .map(|&v| if is_old(v) { new_v } else { v })
             .collect();
-        graph.raw.outputs = new_outputs;
+        graph.storage.outputs = new_outputs;
     }
 }
 
@@ -465,10 +465,10 @@ mod tests {
         let beta = g.add_input(tensor_type(), Some("beta"));
         let ln = g.add_node(OpKind::LayerNorm);
         let out = g.add_value(tensor_type(), Some("out"), ln);
-        g.raw.set_node_inputs(ln, &[x, gamma, beta]);
-        g.raw.set_node_outputs(ln, &[out]);
-        g.raw.add_attr_int(ln, RawAttrKey::Axis, -1);
-        g.raw.add_attr_float(ln, RawAttrKey::Epsilon, 1e-5);
+        g.storage.set_node_inputs(ln, &[x, gamma, beta]);
+        g.storage.set_node_outputs(ln, &[out]);
+        g.storage.add_attr_int(ln, StorageAttrKey::Axis, -1);
+        g.storage.add_attr_float(ln, StorageAttrKey::Epsilon, 1e-5);
         g.mark_output(out);
         g
     }
@@ -505,9 +505,9 @@ mod tests {
         let x = g.add_input(tensor_type(), Some("x"));
         let sm = g.add_node(OpKind::Softmax);
         let out = g.add_value(tensor_type(), Some("out"), sm);
-        g.raw.set_node_inputs(sm, &[x]);
-        g.raw.set_node_outputs(sm, &[out]);
-        g.raw.add_attr_int(sm, RawAttrKey::Axis, -1);
+        g.storage.set_node_inputs(sm, &[x]);
+        g.storage.set_node_outputs(sm, &[out]);
+        g.storage.add_attr_int(sm, StorageAttrKey::Axis, -1);
         g.mark_output(out);
 
         let results = run_decompose(&mut g).unwrap();
@@ -530,8 +530,8 @@ mod tests {
         let x = g.add_input(tensor_type(), Some("x"));
         let gelu = g.add_node(OpKind::Gelu);
         let out = g.add_value(tensor_type(), Some("out"), gelu);
-        g.raw.set_node_inputs(gelu, &[x]);
-        g.raw.set_node_outputs(gelu, &[out]);
+        g.storage.set_node_inputs(gelu, &[x]);
+        g.storage.set_node_outputs(gelu, &[out]);
         g.mark_output(out);
 
         let results = run_decompose(&mut g).unwrap();
@@ -566,8 +566,8 @@ mod tests {
         let x = g.add_input(tensor_type(), Some("x"));
         let add = g.add_node(OpKind::Add);
         let out = g.add_value(tensor_type(), Some("out"), add);
-        g.raw.set_node_inputs(add, &[x, x]);
-        g.raw.set_node_outputs(add, &[out]);
+        g.storage.set_node_inputs(add, &[x, x]);
+        g.storage.set_node_outputs(add, &[out]);
         g.mark_output(out);
 
         let results = run_decompose(&mut g).unwrap();

@@ -8,12 +8,12 @@
 //! - **类型**：静态类型 + shape 进入类型系统（依赖类型）
 //! - **存储**：连续 packed buffer + unsafe + Safe 包装
 //!
-//! 上层用 [`Graph`]（Safe API），下层委托 [`raw::RawGraph`]（unsafe 高效）。
+//! 上层用 [`Graph`]（Safe API），下层委托 [`storage::StorageGraph`]（unsafe 高效）。
 
-pub mod raw;
+pub mod storage;
 
-use raw::{AttrKey, RawGraph};
 use std::collections::{HashMap, HashSet};
+use storage::{AttrKey, StorageGraph};
 
 // ---------------------------------------------------------------------------
 // 错误类型
@@ -232,28 +232,56 @@ pub enum Attr {
 pub struct NodeView<'a> {
     pub id: NodeId,
     pub kind: OpKind,
-    pub raw: &'a RawGraph,
+    pub storage: &'a StorageGraph,
 }
 
 impl<'a> NodeView<'a> {
     pub fn inputs(&self) -> &'a [ValueId] {
-        self.raw.node_inputs(self.id)
+        self.storage.node_inputs(self.id)
     }
     pub fn outputs(&self) -> &'a [ValueId] {
-        self.raw.node_outputs(self.id)
+        self.storage.node_outputs(self.id)
     }
-    pub fn attrs(&self) -> &'a [raw::AttrEntry] {
-        self.raw.node_attrs(self.id)
+    pub fn attrs(&self) -> &'a [storage::AttrEntry] {
+        self.storage.node_attrs(self.id)
     }
 
-    /// 若节点是 Constant 且带 AttrKey::Value (Float) 属性，返回其标量值。
+    /// 若节点是 Constant 且带 AttrKey::Value 属性，返回其标量值。
+    ///
+    /// 支持两种存储形式：
+    /// - `Value=Float`（标量常量，由 `add_constant_f64` 创建）——直接返回
+    /// - `Value=FloatArray` 且恰好 1 个元素（单元素张量常量，如 ONNX initializer
+    ///   shape=[] 或 [1]）——返回该元素，让 algebra/float_opts 等基于标量的 pass
+    ///   也能识别从 ONNX 读入的广播标量
+    ///
+    /// 多元素张量常量返回 None（用 `constant_tensor` 取完整数据）。
     pub fn constant_value(&self) -> Option<f64> {
         if self.kind != OpKind::Constant {
             return None;
         }
+        let mut float_arr: Option<&[f64]> = None;
         for e in self.attrs() {
-            if e.key == AttrKey::Value as u8 && e.tag == raw::AttrTag::Float as u8 {
-                return Some(self.raw.attr_float(e));
+            if e.key == AttrKey::Value as u8 {
+                if e.tag == storage::AttrTag::Float as u8 {
+                    return Some(self.storage.attr_float(e));
+                }
+                if e.tag == storage::AttrTag::FloatArray as u8 {
+                    float_arr = Some(self.storage.attr_float_array(e));
+                }
+            }
+        }
+        float_arr.and_then(|a| if a.len() == 1 { Some(a[0]) } else { None })
+    }
+
+    /// 若节点是 Constant 且带 AttrKey::Value=FloatArray，返回完整张量数据。
+    /// 标量常量（Value=Float）返回 None。
+    pub fn constant_tensor(&self) -> Option<&[f64]> {
+        if self.kind != OpKind::Constant {
+            return None;
+        }
+        for e in self.attrs() {
+            if e.key == AttrKey::Value as u8 && e.tag == storage::AttrTag::FloatArray as u8 {
+                return Some(self.storage.attr_float_array(e));
             }
         }
         None
@@ -264,7 +292,7 @@ impl<'a> NodeView<'a> {
 pub struct ValueView<'a> {
     pub id: ValueId,
     pub type_tag: TypeTag,
-    pub raw: &'a RawGraph,
+    pub storage: &'a StorageGraph,
 }
 
 impl<'a> ValueView<'a> {
@@ -275,31 +303,31 @@ impl<'a> ValueView<'a> {
         self.type_tag.is_tensor()
     }
     pub fn shape(&self) -> &'a [i64] {
-        self.raw.value_shape(self.id)
+        self.storage.value_shape(self.id)
     }
     pub fn name(&self) -> Option<&'a str> {
-        self.raw.value_name(self.id)
+        self.storage.value_name(self.id)
     }
     pub fn def_node(&self) -> NodeId {
-        self.raw.value_def(self.id)
+        self.storage.value_def(self.id)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Graph（Safe API 包装 RawGraph）
+// Graph（Safe API 包装 StorageGraph）
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
 pub struct Graph {
     pub name: String,
-    pub raw: RawGraph,
+    pub storage: StorageGraph,
 }
 
 impl std::fmt::Debug for Graph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Graph")
             .field("name", &self.name)
-            .field("raw", &self.raw)
+            .field("storage", &self.storage)
             .finish()
     }
 }
@@ -308,32 +336,32 @@ impl Graph {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            raw: RawGraph::new(),
+            storage: StorageGraph::new(),
         }
     }
 
     #[inline]
     pub fn node_count(&self) -> usize {
-        self.raw.node_count()
+        self.storage.node_count()
     }
 
     #[inline]
     pub fn value_count(&self) -> usize {
-        self.raw.value_count()
+        self.storage.value_count()
     }
 
     #[inline]
     pub fn inputs(&self) -> &[ValueId] {
-        &self.raw.inputs
+        &self.storage.inputs
     }
 
     #[inline]
     pub fn outputs(&self) -> &[ValueId] {
-        &self.raw.outputs
+        &self.storage.outputs
     }
 
     pub fn add_node(&mut self, kind: OpKind) -> NodeId {
-        self.raw.alloc_node(kind as u8)
+        self.storage.alloc_node(kind as u8)
     }
 
     pub fn add_node_with(
@@ -342,9 +370,9 @@ impl Graph {
         inputs: &[ValueId],
         outputs: &[ValueId],
     ) -> NodeId {
-        let id = self.raw.alloc_node(kind as u8);
-        self.raw.set_node_inputs(id, inputs);
-        self.raw.set_node_outputs(id, outputs);
+        let id = self.storage.alloc_node(kind as u8);
+        self.storage.set_node_inputs(id, inputs);
+        self.storage.set_node_outputs(id, outputs);
         id
     }
 
@@ -353,12 +381,12 @@ impl Graph {
         let (rank, shape_off) = match &ty {
             Type::Scalar(_) => (0u8, 0u32),
             Type::Tensor { dims, .. } => {
-                let off = self.raw.add_shape(dims);
+                let off = self.storage.add_shape(dims);
                 (dims.len() as u8, off)
             }
         };
-        let name_off = self.raw.add_name(name);
-        self.raw
+        let name_off = self.storage.add_name(name);
+        self.storage
             .alloc_value(tag as u8, rank, shape_off, name_off, def)
     }
 
@@ -368,33 +396,33 @@ impl Graph {
 
     /// 构造一个标量 Constant 节点：节点本身 + 输出 value + AttrKey::Value=float
     pub fn add_constant_f64(&mut self, val: f64) -> (NodeId, ValueId) {
-        let node = self.raw.alloc_node(OpKind::Constant as u8);
+        let node = self.storage.alloc_node(OpKind::Constant as u8);
         let out = self.add_value(Type::Scalar(DType::F32), None, node);
-        self.raw.set_node_outputs(node, &[out]);
-        self.raw.add_attr_float(node, AttrKey::Value, val);
+        self.storage.set_node_outputs(node, &[out]);
+        self.storage.add_attr_float(node, AttrKey::Value, val);
         (node, out)
     }
 
     pub fn mark_output(&mut self, v: ValueId) {
-        self.raw.outputs.push(v);
+        self.storage.outputs.push(v);
     }
 
     pub fn mark_input(&mut self, v: ValueId) {
-        self.raw.inputs.push(v);
+        self.storage.inputs.push(v);
     }
 
     pub fn add_attr(&mut self, node: NodeId, key: AttrKey, attr: Attr) {
         match attr {
-            Attr::Int(v) => self.raw.add_attr_int(node, key, v),
-            Attr::Float(v) => self.raw.add_attr_float(node, key, v),
-            Attr::Bool(v) => self.raw.add_attr_bool(node, key, v),
-            Attr::IntArray(v) => self.raw.add_attr_int_array(node, key, &v),
+            Attr::Int(v) => self.storage.add_attr_int(node, key, v),
+            Attr::Float(v) => self.storage.add_attr_float(node, key, v),
+            Attr::Bool(v) => self.storage.add_attr_bool(node, key, v),
+            Attr::IntArray(v) => self.storage.add_attr_int_array(node, key, &v),
         }
     }
 
     pub fn node(&self, id: NodeId) -> Result<NodeView<'_>> {
         let hdr = self
-            .raw
+            .storage
             .node_hdr
             .get(id as usize)
             .ok_or_else(|| NeutronError::Ir(format!("节点 ID {} 越界", id)))?;
@@ -402,13 +430,13 @@ impl Graph {
         Ok(NodeView {
             id,
             kind,
-            raw: &self.raw,
+            storage: &self.storage,
         })
     }
 
     pub fn value(&self, id: ValueId) -> Result<ValueView<'_>> {
         let hdr = self
-            .raw
+            .storage
             .value_hdr
             .get(id as usize)
             .ok_or_else(|| NeutronError::Ir(format!("值 ID {} 越界", id)))?;
@@ -416,7 +444,7 @@ impl Graph {
         Ok(ValueView {
             id,
             type_tag,
-            raw: &self.raw,
+            storage: &self.storage,
         })
     }
 
@@ -503,8 +531,8 @@ impl Graph {
                 .iter()
                 .filter_map(|v| value_map.get(v).copied())
                 .collect();
-            new_graph.raw.set_node_inputs(new_id, &new_inputs);
-            new_graph.raw.set_node_outputs(new_id, &new_outputs);
+            new_graph.storage.set_node_inputs(new_id, &new_inputs);
+            new_graph.storage.set_node_outputs(new_id, &new_outputs);
         }
 
         // 第四遍：图输出重映射
@@ -521,39 +549,42 @@ impl Graph {
 /// 复制一个节点的所有属性到新节点（compact 用）。
 /// 按 AttrTag 分发：Int/Float/Bool 单值，IntArray/FloatArray 数组。
 fn copy_attrs(src: &Graph, old_node: NodeId, dst: &mut Graph, new_node: NodeId) {
-    let attrs = match src.raw.node_attrs(old_node) {
+    let attrs = match src.storage.node_attrs(old_node) {
         a if !a.is_empty() => a,
         _ => return,
     };
     for e in attrs {
         // key 用 from_u8 还原；Custom(255) 或未知 key 跳过（无法 re-add）
-        let key = match raw::AttrKey::from_u8(e.key) {
+        let key = match storage::AttrKey::from_u8(e.key) {
             Some(k) => k,
             None => continue,
         };
-        match raw::AttrTag::from_u8(e.tag) {
-            Some(raw::AttrTag::Int) => {
-                dst.raw.add_attr_int(new_node, key, src.raw.attr_int(e));
+        match storage::AttrTag::from_u8(e.tag) {
+            Some(storage::AttrTag::Int) => {
+                dst.storage
+                    .add_attr_int(new_node, key, src.storage.attr_int(e));
             }
-            Some(raw::AttrTag::Float) => {
-                dst.raw.add_attr_float(new_node, key, src.raw.attr_float(e));
+            Some(storage::AttrTag::Float) => {
+                dst.storage
+                    .add_attr_float(new_node, key, src.storage.attr_float(e));
             }
-            Some(raw::AttrTag::Bool) => {
-                dst.raw.add_attr_bool(new_node, key, src.raw.attr_bool(e));
+            Some(storage::AttrTag::Bool) => {
+                dst.storage
+                    .add_attr_bool(new_node, key, src.storage.attr_bool(e));
             }
-            Some(raw::AttrTag::IntArray) => {
-                let vals = src.raw.attr_int_array(e).to_vec();
-                dst.raw.add_attr_int_array(new_node, key, &vals);
+            Some(storage::AttrTag::IntArray) => {
+                let vals = src.storage.attr_int_array(e).to_vec();
+                dst.storage.add_attr_int_array(new_node, key, &vals);
             }
-            Some(raw::AttrTag::FloatArray) => {
+            Some(storage::AttrTag::FloatArray) => {
                 // 读取 float array（attr_int_array 同构，转 f64 bits 解读）
                 let bytes =
-                    &src.raw.attr_data[e.data_off as usize..(e.data_off + e.data_len) as usize];
+                    &src.storage.attr_data[e.data_off as usize..(e.data_off + e.data_len) as usize];
                 let vals: Vec<f64> = bytes
                     .chunks_exact(8)
                     .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
                     .collect();
-                dst.raw.add_attr_float_array(new_node, key, &vals);
+                dst.storage.add_attr_float_array(new_node, key, &vals);
             }
             None => {}
         }
@@ -619,8 +650,8 @@ pub struct Value {
     pub name: Option<String>,
 }
 
-pub use raw::AttrKey as RawAttrKey;
-pub use raw::AttrTag as RawAttrTag;
+pub use storage::AttrKey as StorageAttrKey;
+pub use storage::AttrTag as StorageAttrTag;
 
 #[cfg(test)]
 mod tests {
@@ -639,8 +670,8 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let add = g.add_node(OpKind::Add);
         let out = g.add_value(Type::Scalar(DType::F32), Some("o"), add);
-        g.raw.set_node_inputs(add, &[x, cval]);
-        g.raw.set_node_outputs(add, &[out]);
+        g.storage.set_node_inputs(add, &[x, cval]);
+        g.storage.set_node_outputs(add, &[out]);
         g.mark_output(out);
 
         // compact 不删任何节点（空 remove 集），只重建图。重建后 Constant 的 Value 属性应保留
@@ -681,9 +712,9 @@ mod tests {
             Some("o"),
             rs,
         );
-        g.raw.set_node_inputs(rs, &[x]);
-        g.raw.set_node_outputs(rs, &[out]);
-        g.raw.add_attr_int(rs, RawAttrKey::Axis, 1);
+        g.storage.set_node_inputs(rs, &[x]);
+        g.storage.set_node_outputs(rs, &[out]);
+        g.storage.add_attr_int(rs, StorageAttrKey::Axis, 1);
         g.mark_output(out);
 
         let empty: HashSet<NodeId> = HashSet::new();
@@ -696,8 +727,8 @@ mod tests {
         // 读 Axis 属性
         let mut axis: i64 = -999;
         for e in new_rs.attrs() {
-            if e.key == RawAttrKey::Axis as u8 {
-                axis = new_g.raw.attr_int(e);
+            if e.key == StorageAttrKey::Axis as u8 {
+                axis = new_g.storage.attr_int(e);
             }
         }
         assert_eq!(axis, 1, "compact 后 Axis 属性应保留");
@@ -710,12 +741,12 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let relu = g.add_node(OpKind::Relu);
         let r_out = g.add_value(Type::Scalar(DType::F32), Some("r"), relu);
-        g.raw.set_node_inputs(relu, &[x]);
-        g.raw.set_node_outputs(relu, &[r_out]);
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[r_out]);
         let add = g.add_node(OpKind::Add);
         let out = g.add_value(Type::Scalar(DType::F32), Some("o"), add);
-        g.raw.set_node_inputs(add, &[r_out, x]);
-        g.raw.set_node_outputs(add, &[out]);
+        g.storage.set_node_inputs(add, &[r_out, x]);
+        g.storage.set_node_outputs(add, &[out]);
         g.mark_output(out);
 
         // 删 relu：但 add 依赖 r_out，r_out 会悬空。

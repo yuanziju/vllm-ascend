@@ -5,6 +5,10 @@
 //! - 不硬编码复合算子模式（MatMul+Add→Linear 这种留给 fuse）
 //! - 有 NaN/Inf 风险的规则（x-x=0、x/x=1）默认禁用，由 `AlgebraConfig.unsafe_opts` 开关控制
 //!
+//! shape-based 简化：除了标量 0/1，还识别"全 0 / 全 1 张量"（多元素 Constant
+//! FloatArray，如 ONNX initializer 的 ones/zeros）。x + zeros→x、x * ones→x、
+//! x * zeros→复用那个 zeros 张量（保留 shape，不退化为标量）。
+//!
 //! 应用方式：`simplify` 是纯函数返回建议；`run_algebraic_simplify` 收集
 //! (old_value → new_value) 替换映射，重写所有节点 inputs，被替换的节点留给 DCE 清理。
 
@@ -34,6 +38,11 @@ pub fn simplify(graph: &Graph, node: NodeView, cfg: AlgebraConfig) -> Result<Sim
         OpKind::Sub => simplify_sub(graph, node, cfg),
         OpKind::Mul => simplify_mul(graph, node),
         OpKind::Div => simplify_div(graph, node, cfg),
+        OpKind::Sqrt => simplify_sqrt(graph, node),
+        OpKind::Exp => simplify_exp(graph, node),
+        OpKind::Pow => simplify_pow(graph, node),
+        OpKind::Reshape => simplify_reshape(graph, node),
+        OpKind::Transpose => simplify_transpose(graph, node),
         _ => Ok(SimplifyResult::NoChange),
     }
 }
@@ -99,10 +108,14 @@ fn simplify_mul(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
     if is_constant_one(graph, a)? {
         return Ok(SimplifyResult::ReplaceWith(b));
     }
-    // x * 0 = 0 (注意：对 NaN 不安全，NaN*0=NaN，但 0 是比 x 更"确定"的值，
-    // 且 x 若含 NaN 则结果本就不确定。此处保守返回 0，因 x*0 数学上=0)
-    if is_constant_zero(graph, b)? || is_constant_zero(graph, a)? {
-        return Ok(SimplifyResult::FoldToConstant(0.0));
+    // x * 0 = 0：复用那个 0 张量（保留 shape，比 FoldToConstant 标量更准）
+    // 注意：对 NaN 不安全（NaN*0=NaN），但 0 是比 x 更"确定"的值，
+    // 且 x 若含 NaN 则结果本就不确定。此处保守返回那个 0 张量
+    if is_constant_zero(graph, b)? {
+        return Ok(SimplifyResult::ReplaceWith(b));
+    }
+    if is_constant_zero(graph, a)? {
+        return Ok(SimplifyResult::ReplaceWith(a));
     }
     Ok(SimplifyResult::NoChange)
 }
@@ -131,6 +144,105 @@ fn simplify_div(graph: &Graph, node: NodeView, cfg: AlgebraConfig) -> Result<Sim
     Ok(SimplifyResult::NoChange)
 }
 
+// --- 一元常量折叠（Sqrt/Exp/Pow 输入为常量时直接算出结果） ---
+
+fn simplify_sqrt(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    let ins = node.inputs();
+    if ins.len() != 1 {
+        return Ok(SimplifyResult::NoChange);
+    }
+    // sqrt(c) = c.sqrt()（c<0 时返回 NaN，与运行时语义一致）
+    if let Some(c) = constant_value(graph, ins[0])? {
+        return Ok(SimplifyResult::FoldToConstant(c.sqrt()));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+fn simplify_exp(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    let ins = node.inputs();
+    if ins.len() != 1 {
+        return Ok(SimplifyResult::NoChange);
+    }
+    if let Some(c) = constant_value(graph, ins[0])? {
+        return Ok(SimplifyResult::FoldToConstant(c.exp()));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+fn simplify_pow(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    let ins = node.inputs();
+    if ins.len() != 2 {
+        return Ok(SimplifyResult::NoChange);
+    }
+    // pow(c1, c2) = c1.powf(c2)（负底数+非整指数返回 NaN，与运行时一致）
+    if let (Some(base), Some(exp)) = (
+        constant_value(graph, ins[0])?,
+        constant_value(graph, ins[1])?,
+    ) {
+        return Ok(SimplifyResult::FoldToConstant(base.powf(exp)));
+    }
+    // x ^ 1 = x
+    if is_constant_one(graph, ins[1])? {
+        return Ok(SimplifyResult::ReplaceWith(ins[0]));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+// --- 基于 shape 的 no-op 简化 ---
+
+fn simplify_reshape(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    let ins = node.inputs();
+    if ins.len() != 1 {
+        return Ok(SimplifyResult::NoChange);
+    }
+    let input = ins[0];
+    let outs = node.outputs();
+    if outs.is_empty() {
+        return Ok(SimplifyResult::NoChange);
+    }
+    let in_shape = graph.value(input)?.shape();
+    let out_shape = graph.value(outs[0])?.shape();
+    // 输入输出 shape 都已知且相等 → reshape 是 no-op
+    if shape_known(in_shape) && shape_known(out_shape) && in_shape == out_shape {
+        return Ok(SimplifyResult::ReplaceWith(input));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+fn simplify_transpose(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    let ins = node.inputs();
+    if ins.len() != 1 {
+        return Ok(SimplifyResult::NoChange);
+    }
+    let input = ins[0];
+    // 读 perm 属性，单位排列 [0,1,...,n-1] → no-op
+    let perm = match read_perm(graph, node.id)? {
+        Some(p) => p,
+        None => return Ok(SimplifyResult::NoChange),
+    };
+    let identity: Vec<i64> = (0..perm.len() as i64).collect();
+    if perm == identity {
+        return Ok(SimplifyResult::ReplaceWith(input));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+fn shape_known(s: &[i64]) -> bool {
+    !s.is_empty() && s.iter().all(|&d| d > 0)
+}
+
+fn read_perm(graph: &Graph, node: NodeId) -> Result<Option<Vec<i64>>> {
+    let n = graph.node(node)?;
+    for e in n.attrs() {
+        if e.key == base::StorageAttrKey::Perm as u8
+            && e.tag == base::storage::AttrTag::IntArray as u8
+        {
+            return Ok(Some(n.storage.attr_int_array(e).to_vec()));
+        }
+    }
+    Ok(None)
+}
+
 // --- 常量识别辅助 ---
 
 fn constant_value(graph: &Graph, v: ValueId) -> Result<Option<f64>> {
@@ -143,12 +255,39 @@ fn constant_value(graph: &Graph, v: ValueId) -> Result<Option<f64>> {
     Ok(node.constant_value())
 }
 
+/// 判断常量张量是否"所有元素都等于 target"。
+///
+/// 覆盖三种存储形式：
+/// - 标量 Constant（Value=Float）：直接比 target
+/// - 单元素张量 Constant（Value=FloatArray 且 len==1）：取该元素
+/// - 多元素张量 Constant（Value=FloatArray 且 len>1）：全等检查
+///
+/// 非常量或空张量返回 false。这让 algebra 能识别 ONNX initializer 的
+/// ones/zeros（多元素全 1/全 0 张量），不仅限于标量 0/1。
+fn constant_is_uniform(graph: &Graph, v: ValueId, target: f64) -> Result<bool> {
+    let val = graph.value(v)?;
+    let def = val.def_node();
+    if def == u32::MAX {
+        return Ok(false);
+    }
+    let node = graph.node(def)?;
+    // 标量 / 单元素：constant_value 即可
+    if let Some(scalar) = node.constant_value() {
+        return Ok(scalar == target);
+    }
+    // 多元素张量：全等检查
+    if let Some(tensor) = node.constant_tensor() {
+        return Ok(!tensor.is_empty() && tensor.iter().all(|&x| x == target));
+    }
+    Ok(false)
+}
+
 fn is_constant_zero(graph: &Graph, v: ValueId) -> Result<bool> {
-    Ok(constant_value(graph, v)?.map(|f| f == 0.0).unwrap_or(false))
+    constant_is_uniform(graph, v, 0.0)
 }
 
 fn is_constant_one(graph: &Graph, v: ValueId) -> Result<bool> {
-    Ok(constant_value(graph, v)?.map(|f| f == 1.0).unwrap_or(false))
+    constant_is_uniform(graph, v, 1.0)
 }
 
 /// 应用代数简化到整个图。
@@ -225,13 +364,13 @@ fn rewrite_inputs(graph: &mut Graph, replacements: &HashMap<ValueId, ValueId>) {
         let old_inputs: Vec<ValueId> = graph.node(nid).unwrap().inputs().to_vec();
         let new_inputs: Vec<ValueId> = old_inputs.iter().map(|&v| lookup(v)).collect();
         if old_inputs != new_inputs {
-            graph.raw.set_node_inputs(nid, &new_inputs);
+            graph.storage.set_node_inputs(nid, &new_inputs);
         }
     }
     let old_outputs: Vec<ValueId> = graph.outputs().to_vec();
     let new_outputs: Vec<ValueId> = old_outputs.iter().map(|&v| lookup(v)).collect();
     if old_outputs != new_outputs {
-        graph.raw.outputs = new_outputs;
+        graph.storage.outputs = new_outputs;
     }
 }
 
@@ -259,8 +398,8 @@ mod tests {
             Some("out"),
             add,
         );
-        g.raw.set_node_inputs(add, &[x, zero]);
-        g.raw.set_node_outputs(add, &[out]);
+        g.storage.set_node_inputs(add, &[x, zero]);
+        g.storage.set_node_outputs(add, &[out]);
         g.mark_output(out);
         g
     }
@@ -281,8 +420,8 @@ mod tests {
         let (_c, one) = g.add_constant_f64(1.0);
         let mul = g.add_node(OpKind::Mul);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), mul);
-        g.raw.set_node_inputs(mul, &[x, one]);
-        g.raw.set_node_outputs(mul, &[out]);
+        g.storage.set_node_inputs(mul, &[x, one]);
+        g.storage.set_node_outputs(mul, &[out]);
         g.mark_output(out);
         let count = run_algebraic_simplify(&mut g).unwrap();
         assert_eq!(count, 1);
@@ -296,8 +435,8 @@ mod tests {
         let (_c, zero) = g.add_constant_f64(0.0);
         let mul = g.add_node(OpKind::Mul);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), mul);
-        g.raw.set_node_inputs(mul, &[x, zero]);
-        g.raw.set_node_outputs(mul, &[out]);
+        g.storage.set_node_inputs(mul, &[x, zero]);
+        g.storage.set_node_outputs(mul, &[out]);
         g.mark_output(out);
         let count = run_algebraic_simplify(&mut g).unwrap();
         assert_eq!(count, 1);
@@ -316,8 +455,8 @@ mod tests {
         let (_c2, b) = g.add_constant_f64(4.0);
         let add = g.add_node(OpKind::Add);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), add);
-        g.raw.set_node_inputs(add, &[a, b]);
-        g.raw.set_node_outputs(add, &[out]);
+        g.storage.set_node_inputs(add, &[a, b]);
+        g.storage.set_node_outputs(add, &[out]);
         g.mark_output(out);
         let count = run_algebraic_simplify(&mut g).unwrap();
         assert_eq!(count, 1);
@@ -333,8 +472,8 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let sub = g.add_node(OpKind::Sub);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sub);
-        g.raw.set_node_inputs(sub, &[x, x]);
-        g.raw.set_node_outputs(sub, &[out]);
+        g.storage.set_node_inputs(sub, &[x, x]);
+        g.storage.set_node_outputs(sub, &[out]);
         g.mark_output(out);
         // 默认 unsafe_opts=false，不应简化
         let count = run_algebraic_simplify(&mut g).unwrap();
@@ -347,8 +486,8 @@ mod tests {
         let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
         let sub = g.add_node(OpKind::Sub);
         let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sub);
-        g.raw.set_node_inputs(sub, &[x, x]);
-        g.raw.set_node_outputs(sub, &[out]);
+        g.storage.set_node_inputs(sub, &[x, x]);
+        g.storage.set_node_outputs(sub, &[out]);
         g.mark_output(out);
         let count = run_with_config(&mut g, AlgebraConfig { unsafe_opts: true }).unwrap();
         assert_eq!(count, 1);
@@ -356,5 +495,340 @@ mod tests {
         let def = g.value(out_v).unwrap().def_node();
         let def_node = g.node(def).unwrap();
         assert_eq!(def_node.constant_value(), Some(0.0));
+    }
+
+    #[test]
+    fn reshape_noop_when_same_shape() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let reshape = g.add_node(OpKind::Reshape);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            reshape,
+        );
+        g.storage.set_node_inputs(reshape, &[x]);
+        g.storage.set_node_outputs(reshape, &[out]);
+        g.storage
+            .add_attr_int_array(reshape, base::StorageAttrKey::Shape, &[2, 3]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // 输出应重写为 x
+        assert_eq!(g.outputs(), &[x]);
+    }
+
+    #[test]
+    fn reshape_kept_when_different_shape() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let reshape = g.add_node(OpKind::Reshape);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![6],
+            },
+            Some("out"),
+            reshape,
+        );
+        g.storage.set_node_inputs(reshape, &[x]);
+        g.storage.set_node_outputs(reshape, &[out]);
+        g.storage
+            .add_attr_int_array(reshape, base::StorageAttrKey::Shape, &[6]);
+        g.mark_output(out);
+        // shape 不同，不应消除
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn transpose_noop_when_identity_perm() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let tr = g.add_node(OpKind::Transpose);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            tr,
+        );
+        g.storage.set_node_inputs(tr, &[x]);
+        g.storage.set_node_outputs(tr, &[out]);
+        g.storage
+            .add_attr_int_array(tr, base::StorageAttrKey::Perm, &[0, 1]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(g.outputs(), &[x]);
+    }
+
+    #[test]
+    fn transpose_kept_when_non_identity_perm() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let tr = g.add_node(OpKind::Transpose);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![3, 2],
+            },
+            Some("out"),
+            tr,
+        );
+        g.storage.set_node_inputs(tr, &[x]);
+        g.storage.set_node_outputs(tr, &[out]);
+        g.storage
+            .add_attr_int_array(tr, base::StorageAttrKey::Perm, &[1, 0]);
+        g.mark_output(out);
+        // perm 非单位排列，不应消除
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // --- 一元常量折叠测试 ---
+
+    #[test]
+    fn sqrt_constant_folds() {
+        let mut g = Graph::new("test");
+        let (_c, a) = g.add_constant_f64(9.0);
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[a]);
+        g.storage.set_node_outputs(sqrt, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let out_v = g.outputs()[0];
+        let def = g.value(out_v).unwrap().def_node();
+        assert_eq!(g.node(def).unwrap().constant_value(), Some(3.0));
+    }
+
+    #[test]
+    fn exp_constant_folds() {
+        let mut g = Graph::new("test");
+        let (_c, a) = g.add_constant_f64(0.0);
+        let exp = g.add_node(OpKind::Exp);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), exp);
+        g.storage.set_node_inputs(exp, &[a]);
+        g.storage.set_node_outputs(exp, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let out_v = g.outputs()[0];
+        let def = g.value(out_v).unwrap().def_node();
+        assert_eq!(g.node(def).unwrap().constant_value(), Some(1.0));
+    }
+
+    #[test]
+    fn pow_two_constants_fold() {
+        let mut g = Graph::new("test");
+        let (_c1, base) = g.add_constant_f64(2.0);
+        let (_c2, exp) = g.add_constant_f64(10.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[base, exp]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let out_v = g.outputs()[0];
+        let def = g.value(out_v).unwrap().def_node();
+        assert_eq!(g.node(def).unwrap().constant_value(), Some(1024.0));
+    }
+
+    #[test]
+    fn pow_x_to_one_replaced_with_x() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, one) = g.add_constant_f64(1.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, one]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // x^1 = x，输出应直接指向 x
+        assert_eq!(g.outputs(), &[x]);
+    }
+
+    #[test]
+    fn sqrt_non_constant_not_folded() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[x]);
+        g.storage.set_node_outputs(sqrt, &[out]);
+        g.mark_output(out);
+        // 输入非常量，不应折叠
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // --- shape-based 简化（多元素全 0/全 1 张量）---
+
+    /// 构造一个多元素 Constant 张量节点（Value=FloatArray），shape=dims，值=vals。
+    fn add_constant_tensor(g: &mut Graph, dims: &[i64], vals: &[f64], name: &str) -> ValueId {
+        let node = g.add_node(OpKind::Constant);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: dims.to_vec(),
+            },
+            Some(name),
+            node,
+        );
+        g.storage.set_node_outputs(node, &[out]);
+        g.storage
+            .add_attr_float_array(node, base::StorageAttrKey::Value, vals);
+        out
+    }
+
+    #[test]
+    fn mul_with_ones_tensor_simplifies() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        // ones [2,3] 全 1
+        let ones = add_constant_tensor(&mut g, &[2, 3], &[1.0; 6], "ones");
+        let mul = g.add_node(OpKind::Mul);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            mul,
+        );
+        g.storage.set_node_inputs(mul, &[x, ones]);
+        g.storage.set_node_outputs(mul, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1, "x*ones 应简化为 x");
+        assert_eq!(g.outputs(), &[x], "输出应重写为 x");
+    }
+
+    #[test]
+    fn add_with_zeros_tensor_simplifies() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let zeros = add_constant_tensor(&mut g, &[2, 3], &[0.0; 6], "zeros");
+        let add = g.add_node(OpKind::Add);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            add,
+        );
+        g.storage.set_node_inputs(add, &[x, zeros]);
+        g.storage.set_node_outputs(add, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1, "x+zeros 应简化为 x");
+        assert_eq!(g.outputs(), &[x], "输出应重写为 x");
+    }
+
+    #[test]
+    fn mul_with_zeros_tensor_replaced() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let zeros = add_constant_tensor(&mut g, &[2, 3], &[0.0; 6], "zeros");
+        let mul = g.add_node(OpKind::Mul);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            mul,
+        );
+        g.storage.set_node_inputs(mul, &[x, zeros]);
+        g.storage.set_node_outputs(mul, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1, "x*zeros 应简化");
+        // 结果应复用那个 zeros 张量（保留 shape，不退化为标量）
+        assert_eq!(
+            g.outputs(),
+            &[zeros],
+            "输出应重写为 zeros 张量本身（保留 shape）"
+        );
+    }
+
+    #[test]
+    fn non_uniform_tensor_not_simplified() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
+            Some("x"),
+        );
+        // [1, 0, 1, 0] 非全 1 也非全 0，不应触发 x*ones/x*zeros
+        let mixed = add_constant_tensor(&mut g, &[2, 2], &[1.0, 0.0, 1.0, 0.0], "mixed");
+        let mul = g.add_node(OpKind::Mul);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 2],
+            },
+            Some("out"),
+            mul,
+        );
+        g.storage.set_node_inputs(mul, &[x, mixed]);
+        g.storage.set_node_outputs(mul, &[out]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0, "非均匀张量不应简化");
     }
 }
