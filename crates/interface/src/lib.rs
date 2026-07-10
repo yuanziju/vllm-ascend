@@ -323,4 +323,51 @@ mod tests {
             "isel 应为 Rsqrt 选出 'rsqrt' 指令"
         );
     }
+
+    /// `Pow(x, -0.5)` 模式：float_opts 的 PowHalfToSqrt 应把它重写成 Rsqrt，
+    /// 全链路通 lowering/isel。RMSNorm 的 `x * Pow(var+eps, -0.5)` 常见此模式
+    #[test]
+    fn pow_neg_half_pipeline_becomes_rsqrt() {
+        use base::{Graph, OpKind, Type};
+        let mut graph = Graph::new("pow_rmsnorm");
+        let ty = Type::Tensor {
+            dtype: base::DType::F32,
+            dims: vec![2, 3],
+        };
+        let x = graph.add_input(ty.clone(), Some("x"));
+        let (_c, neg_half) = graph.add_constant_f64(-0.5);
+        let pow = graph.add_node(OpKind::Pow);
+        let out = graph.add_value(ty, Some("out"), pow);
+        graph.storage.set_node_inputs(pow, &[x, neg_half]);
+        graph.storage.set_node_outputs(pow, &[out]);
+        graph.mark_output(out);
+
+        let mut pm = optimizer::PassManager::default_for(OptLevel::O2, Target::Cuda);
+        pm.run(&mut graph).unwrap();
+
+        // Pow(x,-0.5) 应被 float_opts 重写成 Rsqrt
+        let has_rsqrt = graph.node_ids().any(|id| {
+            graph
+                .node(id)
+                .map(|n| n.kind == base::OpKind::Rsqrt)
+                .unwrap_or(false)
+        });
+        assert!(has_rsqrt, "Pow(x,-0.5) 应重写成 Rsqrt");
+        // 原始 Pow 节点不应再以 Pow 形式存在（已改 Rsqrt）
+        let has_pow = graph.node_ids().any(|id| {
+            graph
+                .node(id)
+                .map(|n| n.kind == base::OpKind::Pow)
+                .unwrap_or(false)
+        });
+        assert!(!has_pow, "不应残留 Pow 节点（应已变 Rsqrt）");
+
+        // 全链路：lowering 发 rsqrt kernel、isel 选 rsqrt 指令
+        let arch_graph = arch::lower(&graph, Target::Cuda).unwrap();
+        let instrs = isel::select(&arch_graph).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.op == "rsqrt"),
+            "isel 应为 Rsqrt 选出 'rsqrt' 指令"
+        );
+    }
 }
