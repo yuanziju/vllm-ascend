@@ -4,7 +4,7 @@ Guidance for AI coding agents working in the **Neutron** repository.
 
 > 这是 Neutron 项目（Rust ML 编译器）的 agent 指南。前任 agent 因 P0 级事故销毁过项目，本文件含**防 P0 安全规则**与 **Continuity Log（进度遗言）**，每轮工作前必读。
 >
-> **操作流程见 [WORKFLOW.md](WORKFLOW.md)**：每次新会话上手的标准 checklist（验证回归 → 建分支 → 频繁提交 → 写遗言 → 合并）。本文件是项目宪法，WORKFLOW.md 是操作手册，两者配合。
+> **操作流程见 [WORKSPEC.md](WORKSPEC.md)**：每次新会话上手的标准 checklist + **时间盒执行规则**（验证回归 → 建分支 → 计时北京时间 → 列待办/子代理并行做满规定时长 → 到点写遗言合并）。本文件是项目宪法，WORKSPEC.md 是操作手册，两者配合。
 
 ## Project Overview
 
