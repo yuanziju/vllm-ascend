@@ -382,7 +382,7 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 - `cargo build --workspace`：0 warning
 - `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
 - `cargo fmt --all -- --check`：clean
-- `cargo test --workspace`：124 passed（base 3 + common 2 + frontend 23 + interface 4 + isel 12 + lisp 4 + optimizer 76）—— 较上轮 119 +5（5 新 float_opts 单测）
+- `cargo test --workspace`：125 passed（base 3 + common 2 + frontend 23 + interface 5 + isel 12 + lisp 4 + optimizer 76）—— 较上轮 119 +6（5 新 float_opts 单测 + 1 Pow e2e）
 - CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
 
 **设计哲学遵守**：Pow 系列重写是"通用幂函数 → 专用 IEEE754 硬件指令"的浮点结构优化，正是设计哲学点名"类 Quake III fast inverse sqrt"同族——Pow 用 log/exp 超越函数实现，Sqrt/Rsqrt/Reciprocal 都是单条硬件指令。非贪心模式匹配（不是 Pow+Mul→xxx 复合算子融合）。
