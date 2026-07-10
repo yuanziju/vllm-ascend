@@ -34,6 +34,8 @@ pub fn simplify(graph: &Graph, node: NodeView, cfg: AlgebraConfig) -> Result<Sim
         OpKind::Sub => simplify_sub(graph, node, cfg),
         OpKind::Mul => simplify_mul(graph, node),
         OpKind::Div => simplify_div(graph, node, cfg),
+        OpKind::Reshape => simplify_reshape(graph, node),
+        OpKind::Transpose => simplify_transpose(graph, node),
         _ => Ok(SimplifyResult::NoChange),
     }
 }
@@ -129,6 +131,61 @@ fn simplify_div(graph: &Graph, node: NodeView, cfg: AlgebraConfig) -> Result<Sim
         return Ok(SimplifyResult::FoldToConstant(1.0));
     }
     Ok(SimplifyResult::NoChange)
+}
+
+// --- 基于 shape 的 no-op 简化 ---
+
+fn simplify_reshape(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    let ins = node.inputs();
+    if ins.len() != 1 {
+        return Ok(SimplifyResult::NoChange);
+    }
+    let input = ins[0];
+    let outs = node.outputs();
+    if outs.is_empty() {
+        return Ok(SimplifyResult::NoChange);
+    }
+    let in_shape = graph.value(input)?.shape();
+    let out_shape = graph.value(outs[0])?.shape();
+    // 输入输出 shape 都已知且相等 → reshape 是 no-op
+    if shape_known(in_shape) && shape_known(out_shape) && in_shape == out_shape {
+        return Ok(SimplifyResult::ReplaceWith(input));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+fn simplify_transpose(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    let ins = node.inputs();
+    if ins.len() != 1 {
+        return Ok(SimplifyResult::NoChange);
+    }
+    let input = ins[0];
+    // 读 perm 属性，单位排列 [0,1,...,n-1] → no-op
+    let perm = match read_perm(graph, node.id)? {
+        Some(p) => p,
+        None => return Ok(SimplifyResult::NoChange),
+    };
+    let identity: Vec<i64> = (0..perm.len() as i64).collect();
+    if perm == identity {
+        return Ok(SimplifyResult::ReplaceWith(input));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+fn shape_known(s: &[i64]) -> bool {
+    !s.is_empty() && s.iter().all(|&d| d > 0)
+}
+
+fn read_perm(graph: &Graph, node: NodeId) -> Result<Option<Vec<i64>>> {
+    let n = graph.node(node)?;
+    for e in n.attrs() {
+        if e.key == base::StorageAttrKey::Perm as u8
+            && e.tag == base::storage::AttrTag::IntArray as u8
+        {
+            return Ok(Some(n.storage.attr_int_array(e).to_vec()));
+        }
+    }
+    Ok(None)
 }
 
 // --- 常量识别辅助 ---
@@ -356,5 +413,122 @@ mod tests {
         let def = g.value(out_v).unwrap().def_node();
         let def_node = g.node(def).unwrap();
         assert_eq!(def_node.constant_value(), Some(0.0));
+    }
+
+    #[test]
+    fn reshape_noop_when_same_shape() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let reshape = g.add_node(OpKind::Reshape);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            reshape,
+        );
+        g.storage.set_node_inputs(reshape, &[x]);
+        g.storage.set_node_outputs(reshape, &[out]);
+        g.storage
+            .add_attr_int_array(reshape, base::StorageAttrKey::Shape, &[2, 3]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // 输出应重写为 x
+        assert_eq!(g.outputs(), &[x]);
+    }
+
+    #[test]
+    fn reshape_kept_when_different_shape() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let reshape = g.add_node(OpKind::Reshape);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![6],
+            },
+            Some("out"),
+            reshape,
+        );
+        g.storage.set_node_inputs(reshape, &[x]);
+        g.storage.set_node_outputs(reshape, &[out]);
+        g.storage
+            .add_attr_int_array(reshape, base::StorageAttrKey::Shape, &[6]);
+        g.mark_output(out);
+        // shape 不同，不应消除
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn transpose_noop_when_identity_perm() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let tr = g.add_node(OpKind::Transpose);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            tr,
+        );
+        g.storage.set_node_inputs(tr, &[x]);
+        g.storage.set_node_outputs(tr, &[out]);
+        g.storage
+            .add_attr_int_array(tr, base::StorageAttrKey::Perm, &[0, 1]);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(g.outputs(), &[x]);
+    }
+
+    #[test]
+    fn transpose_kept_when_non_identity_perm() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let tr = g.add_node(OpKind::Transpose);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![3, 2],
+            },
+            Some("out"),
+            tr,
+        );
+        g.storage.set_node_inputs(tr, &[x]);
+        g.storage.set_node_outputs(tr, &[out]);
+        g.storage
+            .add_attr_int_array(tr, base::StorageAttrKey::Perm, &[1, 0]);
+        g.mark_output(out);
+        // perm 非单位排列，不应消除
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0);
     }
 }

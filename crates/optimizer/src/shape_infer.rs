@@ -9,7 +9,9 @@
 //!   单输入取输入 shape；双输入取广播结果 shape
 //! - **reduce**（ReduceSum/ReduceMean/ReduceMax）：沿 axis 消去一维
 //! - **MatMul**：取第一个输入的行 × 第二个输入的列
-//! - 其余 op（Reshape/Transpose/Concat 等）保守不动
+//! - **Reshape**：输出 shape = attr Shape（IntArray）
+//! - **Transpose**：输出 shape = 输入 shape 按 perm 重排
+//! - 其余 op（Concat 等）保守不动
 //!
 //! 未知标记：shape 含 -1 表示该维未知。广播时 -1 维向已知维靠拢。
 
@@ -126,6 +128,46 @@ fn infer_shape(graph: &Graph, node_id: NodeId) -> Result<Option<Vec<i64>>> {
             // 简化：只推最后一维 shape [m, n]，忽略 batch
             vec![m, n]
         }
+        // Reshape：输出 shape = attr Shape（IntArray），要求输入 shape 已知
+        OpKind::Reshape => {
+            if ins.is_empty() {
+                return Ok(None);
+            }
+            let s = graph.value(ins[0])?.shape();
+            if !shape_known(s) {
+                return Ok(None);
+            }
+            match read_int_array_attr(graph, node_id, base::StorageAttrKey::Shape)? {
+                Some(target) => target,
+                None => return Ok(None),
+            }
+        }
+        // Transpose：输出 shape = 输入 shape 按 perm 重排，要求输入 shape 已知
+        OpKind::Transpose => {
+            if ins.is_empty() {
+                return Ok(None);
+            }
+            let s = graph.value(ins[0])?.shape().to_vec();
+            if s.is_empty() || !shape_known(&s) {
+                return Ok(None);
+            }
+            match read_int_array_attr(graph, node_id, base::StorageAttrKey::Perm)? {
+                Some(perm) => {
+                    if perm.len() != s.len() {
+                        return Ok(None);
+                    }
+                    let mut out = Vec::with_capacity(s.len());
+                    for &p in &perm {
+                        if p < 0 || p as usize >= s.len() {
+                            return Ok(None);
+                        }
+                        out.push(s[p as usize]);
+                    }
+                    out
+                }
+                None => return Ok(None),
+            }
+        }
         // 其余 op 保守不动
         _ => return Ok(None),
     };
@@ -142,6 +184,21 @@ fn read_axis(graph: &Graph, node_id: NodeId) -> Result<i64> {
         }
     }
     Ok(-1)
+}
+
+/// 读取节点 IntArray 属性，找不到返回 None
+fn read_int_array_attr(
+    graph: &Graph,
+    node_id: NodeId,
+    key: base::StorageAttrKey,
+) -> Result<Option<Vec<i64>>> {
+    let n = graph.node(node_id)?;
+    for e in n.attrs() {
+        if e.key == key as u8 && e.tag == base::storage::AttrTag::IntArray as u8 {
+            return Ok(Some(n.storage.attr_int_array(e).to_vec()));
+        }
+    }
+    Ok(None)
 }
 
 /// 应用形状推断到整个图。返回回填的 value 数。
@@ -293,5 +350,39 @@ mod tests {
         let n = apply_shape_infer(&mut g).unwrap();
         assert!(n >= 2, "链式两步都应回填");
         assert_eq!(g.value(a_out).unwrap().shape(), &[2, 3]);
+    }
+
+    #[test]
+    fn infers_reshape() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(tensor(vec![2, 3]), Some("x"));
+        let rs = g.add_node(OpKind::Reshape);
+        let out = g.add_value(tensor(vec![-1, -1]), Some("o"), rs);
+        g.storage.set_node_inputs(rs, &[x]);
+        g.storage.set_node_outputs(rs, &[out]);
+        g.storage
+            .add_attr_int_array(rs, StorageAttrKey::Shape, &[6]);
+        g.mark_output(out);
+
+        apply_shape_infer(&mut g).unwrap();
+        let s = g.value(out).unwrap().shape();
+        assert_eq!(s, &[6], "Reshape 输出 shape = attr Shape");
+    }
+
+    #[test]
+    fn infers_transpose() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(tensor(vec![2, 3]), Some("x"));
+        let tr = g.add_node(OpKind::Transpose);
+        let out = g.add_value(tensor(vec![-1, -1]), Some("o"), tr);
+        g.storage.set_node_inputs(tr, &[x]);
+        g.storage.set_node_outputs(tr, &[out]);
+        g.storage
+            .add_attr_int_array(tr, StorageAttrKey::Perm, &[1, 0]);
+        g.mark_output(out);
+
+        apply_shape_infer(&mut g).unwrap();
+        let s = g.value(out).unwrap().shape();
+        assert_eq!(s, &[3, 2], "Transpose perm=[1,0] 把 [2,3] 重排为 [3,2]");
     }
 }
