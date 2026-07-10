@@ -366,3 +366,32 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 3. float_opts 可继续：识别 `x * rsqrt(y)` 的 RMSNorm 整体模式做 cost-based 决策；`Sqrt(x*x)` → `Abs(x)`；`Log(Exp(x))` → `x`
 4. fuse 可扩展：reduce + elementwise 更复杂模式
 5. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型
+
+### 2026-07-10 — isel 覆盖审计 + Pow 浮点结构重写（feat/neutron-pow-half + fix/lowering）
+
+**当前状态**：isel 覆盖审计完成（补 5 个数据移动 op 的 lowering+isel 规则）；新增 3 个 Pow 浮点结构重写。回归全绿，已合并回 main。
+
+**本轮是 WORKSPEC 时间盒任务（续上一窗口）**：上一窗口 22:38 开工做 Fused op 修缺口 + 5 浮点重写，本窗口接续完成 isel 覆盖审计 + Pow 重写。
+
+**已完成**（3 commit）：
+- **lowering 移除 unreachable catch-all**（commit db45392，fix/lowering-unreachable-pattern）：上轮 isel 审计给 lowering 补全 5 个数据移动 op（Reshape/Transpose/Concat/Slice/Pool）后，所有 OpKind 变体已显式覆盖，`other =>` catch-all 变 unreachable pattern 触发 clippy -D warnings。修法：移除 catch-all，靠 Rust match 穷举性检查——新增 op 时编译器报 non-exhaustive 强制补 lowering 分支，比 catch-all 更安全（不会静默漏）
+- **float_opts PowHalfToSqrt**（commit 4249ab0）：`Pow(x, 0.5)` → `Sqrt(x)` / `Pow(x, -0.5)` → `Rsqrt(x)`。把通用 Pow（log/exp 实现的超越函数，贵）换成专用单条硬件指令（IEEE754 sqrt/rsqrt，rsqrt 可用 0x5f3759df bit trick）。幂指数 ±0.5 时 x^0.5=√x，x^(-0.5)=1/√x。Pow 节点改 op + 输入换 [x]（丢弃常量指数），输出 value 不变。RMSNorm 的 `x * Pow(var+eps, -0.5)` 常见此模式。4 单测
+- **float_opts PowNegOneToReciprocal**（commit 56d1bd8）：`Pow(x, -1.0)` → `Reciprocal(x)`。x^(-1)=1/x=reciprocal(x)，同 PowHalfToSqrt 一类：通用幂 → 专用 op（单条硬件指令）。1 单测
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：124 passed（base 3 + common 2 + frontend 23 + interface 4 + isel 12 + lisp 4 + optimizer 76）—— 较上轮 119 +5（5 新 float_opts 单测）
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
+
+**设计哲学遵守**：Pow 系列重写是"通用幂函数 → 专用 IEEE754 硬件指令"的浮点结构优化，正是设计哲学点名"类 Quake III fast inverse sqrt"同族——Pow 用 log/exp 超越函数实现，Sqrt/Rsqrt/Reciprocal 都是单条硬件指令。非贪心模式匹配（不是 Pow+Mul→xxx 复合算子融合）。
+
+**isel 覆盖现状**：lowering 现已显式覆盖全部 OpKind 变体（29 个），无 catch-all。isel 规则覆盖 21+ 个 native kernel（含本轮已确认的 rsqrt/reciprocal/fused/custom/reshape/transpose/concat/slice/pool）。新增 op 必须四点全接（base OpKind + from_u8 / shape_infer / cost_model / lowering / isel），否则编译器穷举检查报错。
+
+**下一步**（优先级排序）：
+1. pt 前端：PyTorch 解析（frontend 最后一块占位）
+2. float_opts 可继续：识别 `x * rsqrt(y)` 的 RMSNorm 整体模式做 cost-based 决策；`Sqrt(x*x)` → `Abs(x)`（需新增 Abs op + 全链路接入）；`Log(Exp(x))` → `x`（注意溢出边界）
+3. fuse 可扩展：reduce + elementwise 更复杂模式（当前 binary side inputs + reduce 链头已支持）
+4. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）
+5. isel：规则从文件热加载已有，可考虑按 target 分规则集（CUDA/NPU/CPU 不同指令）
