@@ -15,6 +15,9 @@
 //! - **ExpMulFusion 重排**：`Exp(x) * Exp(y)` → `Exp(x + y)`（省一个 Exp）。
 //!   恒等式 `e^x·e^y = e^(x+y)`。softmax/attention 里 exp 链相乘极常见，exp 是超越函数
 //!   贵，重排成单个 Exp + 便宜 Add。浮点代数重排（类 online-softmax 式），非贪心模式。
+//! - **ExpDivFusion 重排**：`Exp(x) / Exp(y)` → `Exp(x - y)`（省一个 Exp）。
+//!   恒等式 `e^x/e^y = e^(x-y)`，幂除法法则，ExpMulFusion 的对偶。attention 里
+//!   attention score 归一化（exp(score)/sum(exp)）常见此模式。
 //! - **DivByConstToMul**：`x / c` → `x * (1/c)`。除法 latency 远高于乘法，
 //!   预计算倒数转成乘法。注意：对 c=0 不做；浮点倒数有精度损失但可接受。
 //! - **MulByTwoToAdd**：`x * 2.0` → `x + x`。乘以 2 的幂可用 IEEE754 位级
@@ -69,6 +72,14 @@ pub enum FloatOpt {
         x_input: ValueId,
         y_input: ValueId,
     },
+    /// `Exp(x) / Exp(y)` → `Exp(x - y)`（省一个 Exp）。e^x/e^y = e^(x-y)，ExpMulFusion 对偶
+    ExpDivFusion {
+        div_node: base::NodeId,
+        exp_x: base::NodeId,
+        exp_y: base::NodeId,
+        x_input: ValueId,
+        y_input: ValueId,
+    },
 }
 
 pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
@@ -78,6 +89,9 @@ pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
         match n.kind {
             OpKind::Div => {
                 if let Some(opt) = try_match_fast_inv_sqrt(graph, n)? {
+                    opts.push(opt);
+                }
+                if let Some(opt) = try_match_exp_div(graph, n)? {
                     opts.push(opt);
                 }
                 if let Some(opt) = try_match_div_by_reciprocal(graph, n)? {
@@ -224,6 +238,40 @@ fn try_match_exp_mul(graph: &Graph, mul: NodeView) -> Result<Option<FloatOpt>> {
     };
     Ok(Some(FloatOpt::ExpMulFusion {
         mul_node: mul.id,
+        exp_x: a_def,
+        exp_y: b_def,
+        x_input,
+        y_input,
+    }))
+}
+
+/// 识别 `Exp(x) / Exp(y)`：Div 节点，两个输入都是 Exp 节点输出。
+/// `e^x/e^y = e^(x-y)`，幂除法法则，ExpMulFusion 的对偶。省一个 Exp。
+/// 注意：除数(ins[1])必须是 Exp，分子(ins[0])也必须是 Exp（顺序不可换，e^x/e^y≠e^y/e^x）
+fn try_match_exp_div(graph: &Graph, div: NodeView) -> Result<Option<FloatOpt>> {
+    let ins = div.inputs();
+    if ins.len() != 2 {
+        return Ok(None);
+    }
+    let (a, b) = (ins[0], ins[1]);
+    let a_def = graph.value(a)?.def_node();
+    let b_def = graph.value(b)?.def_node();
+    if a_def == u32::MAX || b_def == u32::MAX {
+        return Ok(None);
+    }
+    let a_node = graph.node(a_def)?;
+    let b_node = graph.node(b_def)?;
+    if a_node.kind != OpKind::Exp || b_node.kind != OpKind::Exp {
+        return Ok(None);
+    }
+    let Some(&x_input) = a_node.inputs().first() else {
+        return Ok(None);
+    };
+    let Some(&y_input) = b_node.inputs().first() else {
+        return Ok(None);
+    };
+    Ok(Some(FloatOpt::ExpDivFusion {
+        div_node: div.id,
         exp_x: a_def,
         exp_y: b_def,
         x_input,
@@ -409,6 +457,46 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                         let new_outputs: Vec<ValueId> = old_outputs
                             .iter()
                             .map(|&v| if v == mul_out { exp_out } else { v })
+                            .collect();
+                        graph.storage.outputs = new_outputs;
+                    }
+                }
+                applied += 1;
+            }
+            FloatOpt::ExpDivFusion {
+                div_node,
+                exp_x,
+                exp_y: _,
+                x_input,
+                y_input,
+            } => {
+                // Exp(x)/Exp(y) → Exp(Sub(x,y))：新建 Sub 节点吃 [x,y]，复用 exp_x 节点
+                // 改吃 Sub 输出，Div 输出使用者重写到 exp_x 输出（值相等）
+                let sub_node = graph.add_node(OpKind::Sub);
+                let sub_out =
+                    graph.add_value(type_of_value(graph, x_input)?, Some("diff"), sub_node);
+                graph.storage.set_node_inputs(sub_node, &[x_input, y_input]);
+                graph.storage.set_node_outputs(sub_node, &[sub_out]);
+                graph.storage.set_node_inputs(exp_x, &[sub_out]);
+                let div_outs: Vec<ValueId> = graph.node(div_node)?.outputs().to_vec();
+                let exp_x_outs: Vec<ValueId> = graph.node(exp_x)?.outputs().to_vec();
+                if let (Some(&exp_out), Some(&div_out)) = (exp_x_outs.first(), div_outs.first()) {
+                    let node_ids: Vec<u32> = graph.node_ids().collect();
+                    for nid in node_ids {
+                        let old_inputs: Vec<ValueId> = graph.node(nid)?.inputs().to_vec();
+                        if old_inputs.contains(&div_out) {
+                            let new_inputs: Vec<ValueId> = old_inputs
+                                .iter()
+                                .map(|&v| if v == div_out { exp_out } else { v })
+                                .collect();
+                            graph.storage.set_node_inputs(nid, &new_inputs);
+                        }
+                    }
+                    let old_outputs: Vec<ValueId> = graph.outputs().to_vec();
+                    if old_outputs.contains(&div_out) {
+                        let new_outputs: Vec<ValueId> = old_outputs
+                            .iter()
+                            .map(|&v| if v == div_out { exp_out } else { v })
                             .collect();
                         graph.storage.outputs = new_outputs;
                     }
@@ -815,9 +903,52 @@ mod tests {
             "复用的 exp_x 输入应是 Add 输出"
         );
         // Mul 的输出使用者应被重写到 exp_x 的输出（图输出 out 应指向 exp_x_out）
-        assert!(
-            g.outputs().contains(&ex_out),
-            "图输出应重写到 exp_x 的输出"
+        assert!(g.outputs().contains(&ex_out), "图输出应重写到 exp_x 的输出");
+    }
+
+    /// `Exp(x) / Exp(y)` → `Exp(Sub(x,y))`（省一个 Exp）。e^x/e^y = e^(x-y)
+    #[test]
+    fn exp_div_fuses_to_exp_sub() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let y = g.add_input(Type::Scalar(DType::F32), Some("y"));
+        let exp_x = g.add_node(OpKind::Exp);
+        let ex_out = g.add_value(Type::Scalar(DType::F32), Some("ex"), exp_x);
+        g.storage.set_node_inputs(exp_x, &[x]);
+        g.storage.set_node_outputs(exp_x, &[ex_out]);
+        let exp_y = g.add_node(OpKind::Exp);
+        let ey_out = g.add_value(Type::Scalar(DType::F32), Some("ey"), exp_y);
+        g.storage.set_node_inputs(exp_y, &[y]);
+        g.storage.set_node_outputs(exp_y, &[ey_out]);
+        let div = g.add_node(OpKind::Div);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), div);
+        g.storage.set_node_inputs(div, &[ex_out, ey_out]);
+        g.storage.set_node_outputs(div, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // 应新建 1 个 Sub 节点吃 [x,y]；复用的 exp_x 改吃 Sub 输出
+        let sub_count = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Sub)
+            .count();
+        assert_eq!(sub_count, 1, "应新建 1 个 Sub 节点");
+        let sub_node = g
+            .node_ids()
+            .find(|&id| g.node(id).unwrap().kind == OpKind::Sub)
+            .unwrap();
+        assert_eq!(
+            g.node(sub_node).unwrap().inputs(),
+            &[x, y],
+            "Sub 输入应是 [x, y]"
         );
+        let sub_out = g.node(sub_node).unwrap().outputs()[0];
+        assert_eq!(
+            g.node(exp_x).unwrap().inputs(),
+            &[sub_out],
+            "复用的 exp_x 输入应是 Sub 输出"
+        );
+        assert!(g.outputs().contains(&ex_out), "图输出应重写到 exp_x 的输出");
     }
 }
