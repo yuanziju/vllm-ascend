@@ -58,13 +58,25 @@ fn is_elementwise(kind: OpKind) -> bool {
     )
 }
 
-/// 从 start 往前建链：找 start 的 elementwise 前驱，递归
+/// reduce 类算子（改变 shape，只能在融合链最前面，作为链头）
+fn is_reduce(kind: OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::ReduceSum | OpKind::ReduceMean | OpKind::ReduceMax
+    )
+}
+
+/// 从 start 往前建链：找 start 的 elementwise 前驱，递归。
+/// 链头允许是一个 reduce（reduce→unary elementwise 融合），
+/// reduce 后不再往前扩展（reduce 是 shape 分界点，前后不可同链）。
 fn build_fusion_chain(graph: &Graph, start: base::NodeId) -> Result<Vec<base::NodeId>> {
     let mut chain = vec![start];
     let mut current = start;
     loop {
         let n = graph.node(current)?;
-        let mut next = None;
+        let unary = n.inputs().len() == 1;
+        let mut next_elem = None;
+        let mut next_reduce = None;
         for &vin in n.inputs() {
             let v = graph.value(vin)?;
             let def = v.def_node();
@@ -72,17 +84,26 @@ fn build_fusion_chain(graph: &Graph, start: base::NodeId) -> Result<Vec<base::No
                 continue;
             }
             let pred = graph.node(def)?;
-            if is_elementwise(pred.kind) && is_exclusively_used(graph, vin, current)? {
-                next = Some(def);
+            let excl = is_exclusively_used(graph, vin, current)?;
+            if is_elementwise(pred.kind) && excl {
+                next_elem = Some(def);
                 break;
             }
+            // 仅 unary elementwise 才接 reduce 链头（双输入 elementwise 接 reduce 语义不清）
+            if unary && is_reduce(pred.kind) && excl && next_reduce.is_none() {
+                next_reduce = Some(def);
+            }
         }
-        match next {
-            Some(pred) => {
+        match (next_elem, next_reduce) {
+            (Some(pred), _) => {
                 chain.push(pred);
                 current = pred;
             }
-            None => break,
+            (None, Some(r)) => {
+                chain.push(r);
+                break; // reduce 链头，不再往前
+            }
+            (None, None) => break,
         }
     }
     chain.reverse();
@@ -135,6 +156,25 @@ pub fn apply_fusion(graph: &mut Graph, coeffs: CostCoeffs) -> Result<usize> {
         graph
             .storage
             .add_attr_int_array(tail, base::StorageAttrKey::Shape, &op_seq);
+
+        // 若链头是 reduce，复制其 Axis attr 到融合节点（保留 reduce 轴信息）
+        let head_kind = graph.node(head)?.kind;
+        if is_reduce(head_kind) {
+            let mut axis_val: Option<i64> = None;
+            for e in graph.node(head)?.attrs() {
+                if e.key == base::StorageAttrKey::Axis as u8
+                    && e.tag == base::storage::AttrTag::Int as u8
+                {
+                    axis_val = Some(graph.node(head)?.storage.attr_int(e));
+                    break;
+                }
+            }
+            if let Some(ax) = axis_val {
+                graph
+                    .storage
+                    .add_attr_int(tail, base::StorageAttrKey::Axis, ax);
+            }
+        }
 
         // 链中其余节点（除链尾）标记删除
         for &n in &chain[..chain.len() - 1] {
@@ -262,6 +302,122 @@ mod tests {
         g.storage.set_node_outputs(relu, &[out]);
         g.mark_output(out);
         // 单节点链不应融合
+        let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn reduce_then_unary_elementwise_fuses() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4, 8],
+            },
+            Some("x"),
+        );
+        g.mark_input(x);
+        // ReduceSum(x, axis=1) -> sigmoid(.) -> out
+        let rs = g.add_node(OpKind::ReduceSum);
+        let r_out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
+            Some("r"),
+            rs,
+        );
+        g.storage.set_node_inputs(rs, &[x]);
+        g.storage.set_node_outputs(rs, &[r_out]);
+        g.storage.add_attr_int(rs, base::StorageAttrKey::Axis, 1);
+        let sig = g.add_node(OpKind::Sigmoid);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
+            Some("o"),
+            sig,
+        );
+        g.storage.set_node_inputs(sig, &[r_out]);
+        g.storage.set_node_outputs(sig, &[out]);
+        g.mark_output(out);
+
+        let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
+        assert_eq!(count, 1);
+        // 融合后应只剩 1 个 Custom 节点（原 sigmoid 尾节点改 Custom，reduce 被 compact 删）
+        let customs: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Custom)
+            .collect();
+        assert_eq!(customs.len(), 1);
+        // Custom 节点应保留 reduce 的 axis attr
+        let custom = customs[0];
+        let has_axis = g
+            .node(custom)
+            .unwrap()
+            .attrs()
+            .iter()
+            .any(|e| e.key == base::StorageAttrKey::Axis as u8);
+        assert!(has_axis, "融合节点应保留 reduce 的 axis attr");
+        // reduce 节点应已被 compact 删除
+        let reduces: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::ReduceSum)
+            .collect();
+        assert!(reduces.is_empty(), "reduce 节点应被融合删除");
+    }
+
+    #[test]
+    fn reduce_not_fused_when_output_shared() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4, 8],
+            },
+            Some("x"),
+        );
+        g.mark_input(x);
+        let rs = g.add_node(OpKind::ReduceSum);
+        let r_out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
+            Some("r"),
+            rs,
+        );
+        g.storage.set_node_inputs(rs, &[x]);
+        g.storage.set_node_outputs(rs, &[r_out]);
+        g.storage.add_attr_int(rs, base::StorageAttrKey::Axis, 1);
+        // sigmoid 用 r_out
+        let sig = g.add_node(OpKind::Sigmoid);
+        let s_out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
+            Some("s"),
+            sig,
+        );
+        g.storage.set_node_inputs(sig, &[r_out]);
+        g.storage.set_node_outputs(sig, &[s_out]);
+        // tanh 也用 r_out（非独占）
+        let tanh = g.add_node(OpKind::Tanh);
+        let t_out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
+            Some("t"),
+            tanh,
+        );
+        g.storage.set_node_inputs(tanh, &[r_out]);
+        g.storage.set_node_outputs(tanh, &[t_out]);
+        g.mark_output(s_out);
+        g.mark_output(t_out);
+        // r_out 被两个节点使用，非独占，不应融合
         let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
         assert_eq!(count, 0);
     }
