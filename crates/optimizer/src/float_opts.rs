@@ -3,26 +3,33 @@
 //! 设计哲学：针对浮点本身的结构做优化，不是模式匹配复合算子。
 //!
 //! 实现的优化：
+//! - **FastInvSqrt 融合**：`a / sqrt(b)` → `Mul(a, Rsqrt(b))`（a==1.0 时直接 → `Rsqrt(b)`，
+//!   2 op 降 1 op）。恒等式 `a/√b = a·b^(-1/2)`，把 Sqrt+Div（含一个贵的 Div）融成
+//!   Rsqrt（单条硬件指令 / 0x5f3759df 魔数 bit trick，Quake III fast inverse sqrt）+ 便宜的 Mul。
+//!   RMSNorm/LayerNorm 等 normalization 到处出现。这是浮点结构优化，不是贪心模式匹配。
 //! - **DivByConstToMul**：`x / c` → `x * (1/c)`。除法 latency 远高于乘法，
 //!   预计算倒数转成乘法。注意：对 c=0 不做；浮点倒数有精度损失但可接受。
 //! - **MulByTwoToAdd**：`x * 2.0` → `x + x`。乘以 2 的幂可用 IEEE754 位级
 //!   操作（指数+1），但加法在某些硬件更便宜，且不引入常量。此处保守用加法。
-//! - **FastInvSqrt 识别**：`1.0 / sqrt(x)` 模式识别（不改图，标记为机会），
-//!   后端 lowering 阶段用 0x5f3759df 魔数 trick 实现（Quake III fast inverse sqrt）。
-//! - **SoftmaxOnline 标记**：Softmax 节点标记为可用 online-softmax 重排
-//!   （Flash Attention 式：避免 materialize 中间矩阵，online 计算 max/sum）。
+//! - **SoftmaxOnline 标记**：仅识别不改图。真正的 Flash Attention 融合（softmax+matmul）
+//!   是设计哲学禁止的贪心模式匹配；online-softmax 本质是 kernel tiling 策略非 IR 重写，
+//!   留作 lowering 阶段的 kernel 机会标记。
 
 use base::{Graph, NodeView, OpKind, Result, ValueId};
 
 /// 浮点优化机会（识别到的不一定立即应用）
 #[derive(Debug, Clone)]
 pub enum FloatOpt {
-    /// `1.0 / sqrt(x)` 模式：可替换为 FastInvSqrt 单节点
+    /// `a / sqrt(b)` 模式：融合为 Rsqrt。恒等式 `a/√b = a·b^(-1/2)`。
+    /// a==1.0 常量时直接 → `Rsqrt(b)`（2 op 降 1 op）；否则 → `Mul(a, Rsqrt(b))`
     FastInvSqrt {
         div_node: base::NodeId,
         sqrt_node: base::NodeId,
+        numerator: ValueId,
+        sqrt_input: ValueId,
+        numerator_is_one: bool,
     },
-    /// Softmax 可用 online 算法重排（Flash Attention 式）
+    /// Softmax 可用 online 算法重排（Flash Attention 式，仅标记不改图）
     SoftmaxOnline { softmax_node: base::NodeId },
     /// `x * 2.0` → `x + x`
     MulByTwoToAdd {
@@ -63,30 +70,37 @@ pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
     Ok(opts)
 }
 
-/// 识别 `1.0 / sqrt(x)`：Div 节点，一个输入是常量 1.0，另一个是 Sqrt 节点输出
+/// 识别 `a / sqrt(b)`：Div 节点，除数(ins[1]) 是 Sqrt 节点输出。
+/// 分子 a 可以是任意 value（常量或非常量）。`a/√b = a·b^(-1/2)` 融合为 Rsqrt。
+/// a==1.0 常量时直接 → Rsqrt(b)（2 op 降 1 op）；否则 → Mul(a, Rsqrt(b))。
+/// 注意：只匹配除数是 Sqrt 的情况（`sqrt(x)/a` ≠ `a·rsqrt(x)`，不匹配）
 fn try_match_fast_inv_sqrt(graph: &Graph, div: NodeView) -> Result<Option<FloatOpt>> {
     let ins = div.inputs();
     if ins.len() != 2 {
         return Ok(None);
     }
-    let (a, b) = (ins[0], ins[1]);
-    // 检查 a=1.0 常量，b=sqrt 输出
-    if let (Some(va), None) = (constant_value(graph, a)?, constant_value(graph, b)?) {
-        if va == 1.0 {
-            let b_def = graph.value(b)?.def_node();
-            if b_def != u32::MAX {
-                let b_node = graph.node(b_def)?;
-                if b_node.kind == OpKind::Sqrt {
-                    return Ok(Some(FloatOpt::FastInvSqrt {
-                        div_node: div.id,
-                        sqrt_node: b_def,
-                    }));
-                }
-            }
-        }
+    let (numerator, divisor) = (ins[0], ins[1]);
+    // 除数必须是 Sqrt 节点输出
+    let divisor_def = graph.value(divisor)?.def_node();
+    if divisor_def == u32::MAX {
+        return Ok(None);
     }
-    // 检查 b=1.0 常量，a=sqrt 输出（1.0/sqrt(x) 和 sqrt(x)/1.0 不同，后者无意义）
-    Ok(None)
+    let divisor_node = graph.node(divisor_def)?;
+    if divisor_node.kind != OpKind::Sqrt {
+        return Ok(None);
+    }
+    let Some(&sqrt_input) = divisor_node.inputs().first() else {
+        return Ok(None);
+    };
+    // 分子是否为常量 1.0（特殊case：直接 → Rsqrt，省一个 Mul）
+    let numerator_is_one = matches!(constant_value(graph, numerator)?, Some(v) if v == 1.0);
+    Ok(Some(FloatOpt::FastInvSqrt {
+        div_node: div.id,
+        sqrt_node: divisor_def,
+        numerator,
+        sqrt_input,
+        numerator_is_one,
+    }))
 }
 
 /// 识别 `x * 2.0`：Mul 节点，一个输入是常量 2.0
@@ -142,14 +156,40 @@ fn constant_value(graph: &Graph, v: ValueId) -> Result<Option<f64>> {
 }
 
 /// 应用浮点优化。返回应用次数。
-/// 当前实现 DivByConstToMul 和 MulByTwoToAdd（改图），
-/// FastInvSqrt 和 SoftmaxOnline 仅识别不应用（留给 lowering）。
+/// FastInvSqrt / DivByConstToMul / MulByTwoToAdd 改图；SoftmaxOnline 仅标记不改图。
 pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
     let opts = find_opportunities(graph)?;
     let mut applied = 0usize;
 
     for opt in opts {
         match opt {
+            FloatOpt::FastInvSqrt {
+                div_node,
+                sqrt_node: _,
+                numerator,
+                sqrt_input,
+                numerator_is_one,
+            } => {
+                if numerator_is_one {
+                    // 1.0 / sqrt(b) → Rsqrt(b)：把 Div 节点本身改成 Rsqrt，输入换成 b。
+                    // Div 的输出 value 不变（使用者仍指向它），Sqrt + 1.0 常量变孤儿交给 DCE
+                    graph.storage.set_node_inputs(div_node, &[sqrt_input]);
+                    graph.storage.node_hdr[div_node as usize].op_tag = OpKind::Rsqrt as u8;
+                } else {
+                    // a / sqrt(b) → Mul(a, Rsqrt(b))：新建 Rsqrt 节点吃 b，Div 改 Mul 吃 [a, rsqrt_out]
+                    let rsqrt_node = graph.add_node(OpKind::Rsqrt);
+                    let rsqrt_out = graph.add_value(
+                        type_of_value(graph, sqrt_input)?,
+                        Some("rsqrt"),
+                        rsqrt_node,
+                    );
+                    graph.storage.set_node_inputs(rsqrt_node, &[sqrt_input]);
+                    graph.storage.set_node_outputs(rsqrt_node, &[rsqrt_out]);
+                    graph.storage.set_node_inputs(div_node, &[numerator, rsqrt_out]);
+                    graph.storage.node_hdr[div_node as usize].op_tag = OpKind::Mul as u8;
+                }
+                applied += 1;
+            }
             FloatOpt::DivByConstToMul {
                 div_node,
                 reciprocal,
@@ -177,13 +217,27 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                 graph.storage.node_hdr[mul_node as usize].op_tag = OpKind::Add as u8;
                 applied += 1;
             }
-            FloatOpt::FastInvSqrt { .. } | FloatOpt::SoftmaxOnline { .. } => {
-                // 仅识别，不改图（留给 lowering 阶段用专门 kernel）
+            FloatOpt::SoftmaxOnline { .. } => {
+                // 仅识别，不改图（online-softmax 是 kernel tiling 策略，非 IR 重写）
             }
         }
     }
 
     Ok(applied)
+}
+
+/// 取 value 的 Type（标量或张量），用于新建同型 value
+fn type_of_value(graph: &Graph, v: ValueId) -> Result<base::Type> {
+    let val = graph.value(v)?;
+    let dtype = val.dtype();
+    if val.is_tensor() {
+        Ok(base::Type::Tensor {
+            dtype,
+            dims: val.shape().to_vec(),
+        })
+    } else {
+        Ok(base::Type::Scalar(dtype))
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +305,147 @@ mod tests {
                 .any(|o| matches!(o, FloatOpt::FastInvSqrt { .. })),
             "应识别 FastInvSqrt 机会"
         );
+    }
+
+    /// `1.0 / sqrt(x)` → 单个 Rsqrt(x)：Div 节点本身改 Rsqrt，输入换成 x
+    #[test]
+    fn fast_inv_sqrt_one_becomes_rsqrt() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let sqrt_out = g.add_value(Type::Scalar(DType::F32), Some("sx"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[x]);
+        g.storage.set_node_outputs(sqrt, &[sqrt_out]);
+        let (_c, one) = g.add_constant_f64(1.0);
+        let div = g.add_node(OpKind::Div);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), div);
+        g.storage.set_node_inputs(div, &[one, sqrt_out]);
+        g.storage.set_node_outputs(div, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // Div 节点应已变成 Rsqrt，输入换成 [x]
+        let n = g.node(div).unwrap();
+        assert_eq!(n.kind, OpKind::Rsqrt, "1.0/sqrt(x) 的 Div 应改成 Rsqrt");
+        assert_eq!(n.inputs(), &[x], "Rsqrt 输入应为原 Sqrt 的输入 x");
+        // 输出 value 仍是 out（使用者无感）
+        assert_eq!(n.outputs(), &[out]);
+    }
+
+    /// `a / sqrt(b)`（a 非常量）→ `Mul(a, Rsqrt(b))`：新建 Rsqrt，Div 改 Mul
+    #[test]
+    fn fast_inv_sqrt_general_becomes_mul_rsqrt() {
+        let mut g = Graph::new("test");
+        let a = g.add_input(Type::Scalar(DType::F32), Some("a"));
+        let b = g.add_input(Type::Scalar(DType::F32), Some("b"));
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let sqrt_out = g.add_value(Type::Scalar(DType::F32), Some("sx"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[b]);
+        g.storage.set_node_outputs(sqrt, &[sqrt_out]);
+        let div = g.add_node(OpKind::Div);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), div);
+        g.storage.set_node_inputs(div, &[a, sqrt_out]);
+        g.storage.set_node_outputs(div, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // Div 应改成 Mul，输入 [a, rsqrt_out]
+        let n = g.node(div).unwrap();
+        assert_eq!(n.kind, OpKind::Mul, "a/sqrt(b) 的 Div 应改成 Mul");
+        assert_eq!(n.inputs()[0], a, "Mul 第一个输入应是原分子 a");
+        // 第二个输入是新建的 Rsqrt 节点的输出
+        let rsqrt_out = n.inputs()[1];
+        let rsqrt_def = g.value(rsqrt_out).unwrap().def_node();
+        let rsqrt_node = g.node(rsqrt_def).unwrap();
+        assert_eq!(rsqrt_node.kind, OpKind::Rsqrt, "应新建 Rsqrt 节点");
+        assert_eq!(
+            rsqrt_node.inputs(),
+            &[b],
+            "Rsqrt 输入应为原 Sqrt 的输入 b"
+        );
+    }
+
+    /// `2.0 / sqrt(x)`（分子常量≠1）→ `Mul(2.0, Rsqrt(x))`，不折叠常量
+    #[test]
+    fn fast_inv_sqrt_const_numerator_not_one() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let sqrt_out = g.add_value(Type::Scalar(DType::F32), Some("sx"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[x]);
+        g.storage.set_node_outputs(sqrt, &[sqrt_out]);
+        let (_c, two) = g.add_constant_f64(2.0);
+        let div = g.add_node(OpKind::Div);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), div);
+        g.storage.set_node_inputs(div, &[two, sqrt_out]);
+        g.storage.set_node_outputs(div, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let n = g.node(div).unwrap();
+        assert_eq!(n.kind, OpKind::Mul, "2.0/sqrt(x) 的 Div 应改成 Mul");
+        // 第一个输入仍是常量 2.0
+        assert_eq!(constant_value(&g, n.inputs()[0]).unwrap(), Some(2.0));
+    }
+
+    /// `sqrt(x) / a`（Sqrt 是分子不是除数）不应触发 FastInvSqrt
+    #[test]
+    fn sqrt_as_numerator_not_matched() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let sqrt_out = g.add_value(Type::Scalar(DType::F32), Some("sx"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[x]);
+        g.storage.set_node_outputs(sqrt, &[sqrt_out]);
+        let (_c, two) = g.add_constant_f64(2.0);
+        let div = g.add_node(OpKind::Div);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), div);
+        // sqrt_out 是分子（ins[0]），2.0 是除数（ins[1]）→ 应触发 DivByConstToMul 而非 FastInvSqrt
+        g.storage.set_node_inputs(div, &[sqrt_out, two]);
+        g.storage.set_node_outputs(div, &[out]);
+        g.mark_output(out);
+
+        let opts = find_opportunities(&g).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, FloatOpt::FastInvSqrt { .. })),
+            "sqrt(x)/a 不应识别为 FastInvSqrt（除数不是 Sqrt）"
+        );
+    }
+
+    /// RMSNorm 张量模式：`x / sqrt(y)`（张量）→ `Mul(x, Rsqrt(y))`，shape 正确传递
+    #[test]
+    fn fast_inv_sqrt_tensor_preserves_shape() {
+        let mut g = Graph::new("test");
+        let ty = Type::Tensor {
+            dtype: DType::F32,
+            dims: vec![2, 3],
+        };
+        let x = g.add_input(ty.clone(), Some("x"));
+        let y = g.add_input(ty.clone(), Some("y"));
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let sqrt_out = g.add_value(ty.clone(), Some("sx"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[y]);
+        g.storage.set_node_outputs(sqrt, &[sqrt_out]);
+        let div = g.add_node(OpKind::Div);
+        let out = g.add_value(ty.clone(), Some("out"), div);
+        g.storage.set_node_inputs(div, &[x, sqrt_out]);
+        g.storage.set_node_outputs(div, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let n = g.node(div).unwrap();
+        assert_eq!(n.kind, OpKind::Mul);
+        let rsqrt_out = n.inputs()[1];
+        let rsqrt_def = g.value(rsqrt_out).unwrap().def_node();
+        let rsqrt_node = g.node(rsqrt_def).unwrap();
+        assert_eq!(rsqrt_node.kind, OpKind::Rsqrt);
+        assert_eq!(rsqrt_node.inputs(), &[y]);
     }
 
     #[test]
