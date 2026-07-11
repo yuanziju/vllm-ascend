@@ -1,7 +1,7 @@
 //! lowering — 架构无关图 → 目标架构图
 
 use crate::{ArchGraph, ArchOp};
-use base::{Graph, OpKind, Result};
+use base::{Graph, OpKind, Result, ValueId};
 
 pub fn lower(graph: &Graph, _target: common::Target) -> Result<ArchGraph> {
     let mut ag = ArchGraph::new(_target);
@@ -47,7 +47,14 @@ pub fn lower(graph: &Graph, _target: common::Target) -> Result<ArchGraph> {
             // 所有 OpKind 变体已显式覆盖；新增 op 时编译器会因 non-exhaustive 报错，
             // 强制在此补 lowering 分支——比 catch-all 更安全（不会静默漏）
         };
-        ag.add(ArchOp::KernelCall(native.to_string()));
+        // 透传 IR 节点的 inputs/outputs（ValueId），让寄存器分配能读 def-use
+        let inputs: Vec<ValueId> = n.inputs().to_vec();
+        let outputs: Vec<ValueId> = n.outputs().to_vec();
+        ag.add(ArchOp::KernelCall {
+            name: native.to_string(),
+            inputs,
+            outputs,
+        });
     }
     Ok(ag)
 }

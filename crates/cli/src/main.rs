@@ -7,7 +7,7 @@ use std::process;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("用法: neutron <input.onnx> [--target cuda|npu|cpu] [--opt 0|1|2|3] [--dump]");
+        eprintln!("用法: neutron <input.onnx> [--target cuda|npu|cpu] [--opt 0|1|2|3] [--dump] [--regalloc fast|standard|quality|exhaustive]");
         process::exit(1);
     }
 
@@ -15,6 +15,7 @@ fn main() {
     let mut target = common::Target::Cuda;
     let mut opt_level = common::OptLevel::O2;
     let mut dump_ir = false;
+    let mut regalloc_mode = common::RegAllocMode::default();
 
     let mut i = 2;
     while i < args.len() {
@@ -51,6 +52,21 @@ fn main() {
             "--dump" => {
                 dump_ir = true;
             }
+            "--regalloc" => {
+                i += 1;
+                if i < args.len() {
+                    regalloc_mode = match args[i].as_str() {
+                        "fast" => common::RegAllocMode::Fast,
+                        "standard" => common::RegAllocMode::Standard,
+                        "quality" => common::RegAllocMode::Quality,
+                        "exhaustive" => common::RegAllocMode::Exhaustive,
+                        _ => {
+                            eprintln!("未知 regalloc mode: {}", args[i]);
+                            process::exit(1);
+                        }
+                    };
+                }
+            }
             _ => {
                 eprintln!("未知参数: {}", args[i]);
                 process::exit(1);
@@ -70,6 +86,7 @@ fn main() {
         dump_ir,
         trace_isel: false,
         algebra_unsafe_opts: false,
+        regalloc_mode,
     };
 
     match interface::compile(interface::Input::Onnx(bytes), config) {

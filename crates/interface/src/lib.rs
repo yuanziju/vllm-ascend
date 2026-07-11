@@ -93,6 +93,7 @@ mod tests {
             dump_ir: true,
             trace_isel: false,
             algebra_unsafe_opts: false,
+            regalloc_mode: common::RegAllocMode::default(),
         };
         let out = compile(Input::Onnx(vec![]), cfg).unwrap();
         assert_eq!(out.target, "cuda");

@@ -274,9 +274,9 @@ pub fn select_with_rules(arch_graph: &ArchGraph, rules: &[Rule]) -> Result<Vec<I
     let mut instrs = Vec::new();
     for (i, op) in arch_graph.ops.iter().enumerate() {
         let op_name = match op {
-            ArchOp::KernelCall(name) => name.as_str(),
-            ArchOp::Load => "load",
-            ArchOp::Store => "store",
+            ArchOp::KernelCall { name, .. } => name.as_str(),
+            ArchOp::Load { .. } => "load",
+            ArchOp::Store { .. } => "store",
         };
         match select_one(op_name, i, &target, rules)? {
             Some(ins) => instrs.push(ins),
@@ -323,7 +323,14 @@ mod tests {
 
     #[test]
     fn selects_add_instruction() {
-        let ag = make_arch(Target::Cuda, vec![ArchOp::KernelCall("add".into())]);
+        let ag = make_arch(
+            Target::Cuda,
+            vec![ArchOp::KernelCall {
+                name: "add".into(),
+                inputs: vec![],
+                outputs: vec![],
+            }],
+        );
         let instrs = select(&ag).unwrap();
         assert_eq!(instrs.len(), 1);
         assert_eq!(instrs[0].op, "fadd");
@@ -332,7 +339,14 @@ mod tests {
 
     #[test]
     fn selects_mma_for_cuda() {
-        let ag = make_arch(Target::Cuda, vec![ArchOp::KernelCall("mma".into())]);
+        let ag = make_arch(
+            Target::Cuda,
+            vec![ArchOp::KernelCall {
+                name: "mma".into(),
+                inputs: vec![],
+                outputs: vec![],
+            }],
+        );
         let instrs = select(&ag).unwrap();
         assert_eq!(instrs[0].op, "mma");
         assert_eq!(instrs[0].args, vec!["a", "b", "c"]);
@@ -346,21 +360,41 @@ mod tests {
         )
         .unwrap();
         // cuda 命中
-        let ag_cuda = make_arch(Target::Cuda, vec![ArchOp::KernelCall("mma".into())]);
+        let ag_cuda = make_arch(
+            Target::Cuda,
+            vec![ArchOp::KernelCall {
+                name: "mma".into(),
+                inputs: vec![],
+                outputs: vec![],
+            }],
+        );
         let ins = select_with_rules(&ag_cuda, std::slice::from_ref(&rule)).unwrap();
         assert_eq!(ins[0].op, "wgmma");
     }
 
     #[test]
     fn no_match_returns_error() {
-        let ag = make_arch(Target::Cuda, vec![ArchOp::KernelCall("unknown_op".into())]);
+        let ag = make_arch(
+            Target::Cuda,
+            vec![ArchOp::KernelCall {
+                name: "unknown_op".into(),
+                inputs: vec![],
+                outputs: vec![],
+            }],
+        );
         let err = select(&ag).unwrap_err();
         assert!(matches!(err, NeutronError::Isel(_)));
     }
 
     #[test]
     fn load_store_selected() {
-        let ag = make_arch(Target::Cpu, vec![ArchOp::Load, ArchOp::Store]);
+        let ag = make_arch(
+            Target::Cpu,
+            vec![
+                ArchOp::Load { addr: 0, dst: 0 },
+                ArchOp::Store { addr: 0, src: 0 },
+            ],
+        );
         let instrs = select(&ag).unwrap();
         assert_eq!(instrs[0].op, "load");
         assert_eq!(instrs[1].op, "store");
@@ -370,7 +404,14 @@ mod tests {
     fn idx_bound_in_rule() {
         // 用 idx 生成参数：第 0 个发 "load_0"
         let rule = parse_rule(r#"(rule (when true) (emit (str "+" "load_" idx) "x"))"#).unwrap();
-        let ag = make_arch(Target::Cuda, vec![ArchOp::KernelCall("add".into())]);
+        let ag = make_arch(
+            Target::Cuda,
+            vec![ArchOp::KernelCall {
+                name: "add".into(),
+                inputs: vec![],
+                outputs: vec![],
+            }],
+        );
         // 这条规则不依赖 op，true 恒命中
         let ins = select_with_rules(&ag, &[rule]).unwrap();
         assert!(ins[0].op.contains("load_"));
@@ -387,7 +428,14 @@ mod tests {
         let rules = load_rules_from_src(src).unwrap();
         assert_eq!(rules.len(), 2, "应加载 2 条规则");
         // 用加载的规则选 add
-        let ag = make_arch(Target::Cuda, vec![ArchOp::KernelCall("add".into())]);
+        let ag = make_arch(
+            Target::Cuda,
+            vec![ArchOp::KernelCall {
+                name: "add".into(),
+                inputs: vec![],
+                outputs: vec![],
+            }],
+        );
         let ins = select_with_rules(&ag, &rules).unwrap();
         assert_eq!(ins[0].op, "fadd");
     }
@@ -402,7 +450,14 @@ mod tests {
         std::fs::write(path, content).unwrap();
         let rules = load_rules_from_file(path).unwrap();
         assert_eq!(rules.len(), 1);
-        let ag = make_arch(Target::Cuda, vec![ArchOp::KernelCall("custom_op".into())]);
+        let ag = make_arch(
+            Target::Cuda,
+            vec![ArchOp::KernelCall {
+                name: "custom_op".into(),
+                inputs: vec![],
+                outputs: vec![],
+            }],
+        );
         let ins = select_with_rules(&ag, &rules).unwrap();
         assert_eq!(ins[0].op, "my_instr");
         std::fs::remove_file(path).ok();

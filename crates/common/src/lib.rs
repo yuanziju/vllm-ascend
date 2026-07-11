@@ -21,6 +21,20 @@ pub enum OptLevel {
     O3,
 }
 
+/// 寄存器分配模式（四档，互斥选择）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RegAllocMode {
+    /// 快速模式：线性扫描（Poletto-Sarkar），最快，质量够用
+    Fast,
+    /// 标准模式：SSA 消φ + IRC（graph coloring + coalescing 迭代），兼顾时间下的最优
+    #[default]
+    Standard,
+    /// 质量模式：Standard 基础上加 ML IR 领域特化增强（elementwise 短 live range 激进 coalesce 等）
+    Quality,
+    /// 彩蛋模式：暴力枚举（exhaustive），极慢，教学/验证用
+    Exhaustive,
+}
+
 /// ID 生成器（注意不与 Iterator::next 冲突，用 gen）
 #[derive(Debug, Default)]
 pub struct IdGen {
@@ -77,6 +91,8 @@ pub struct Config {
     /// 启用有 NaN/Inf 风险的代数规则（如 x-x=0、x/x=1）。
     /// 默认 false（保守）。仅当确认无 NaN 时开启。
     pub algebra_unsafe_opts: bool,
+    /// 寄存器分配模式（fast/standard/quality/exhaustive），默认 standard
+    pub regalloc_mode: RegAllocMode,
 }
 
 impl Default for Config {
@@ -87,6 +103,7 @@ impl Default for Config {
             dump_ir: false,
             trace_isel: false,
             algebra_unsafe_opts: false,
+            regalloc_mode: RegAllocMode::default(),
         }
     }
 }
