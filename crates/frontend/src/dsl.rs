@@ -204,6 +204,8 @@ fn map_dsl_op(name: &str) -> OpKind {
         "Sqrt" | "sqrt" => OpKind::Sqrt,
         "Exp" | "exp" => OpKind::Exp,
         "Pow" | "pow" => OpKind::Pow,
+        "Abs" | "abs" => OpKind::Abs,
+        "Log" | "log" => OpKind::Log,
         "ReduceSum" | "reducesum" => OpKind::ReduceSum,
         "ReduceMean" | "reducemean" => OpKind::ReduceMean,
         "ReduceMax" | "reducemax" => OpKind::ReduceMax,

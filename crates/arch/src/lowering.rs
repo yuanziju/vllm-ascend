@@ -23,6 +23,9 @@ pub fn lower(graph: &Graph, _target: common::Target) -> Result<ArchGraph> {
             OpKind::Sqrt => "sqrt",
             OpKind::Rsqrt => "rsqrt",
             OpKind::Reciprocal => "reciprocal",
+            // Abs/Log：单输入，直发同名 kernel
+            OpKind::Abs => "abs",
+            OpKind::Log => "log",
             OpKind::Exp => "exp",
             OpKind::Pow => "pow",
             OpKind::ReduceSum => "reduce_sum",

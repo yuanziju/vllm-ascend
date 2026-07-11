@@ -76,6 +76,8 @@ fn is_elementwise(kind: OpKind) -> bool {
             | OpKind::Tanh
             | OpKind::Sqrt
             | OpKind::Exp
+            | OpKind::Abs
+            | OpKind::Log
     )
 }
 
