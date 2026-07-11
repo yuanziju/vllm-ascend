@@ -33,6 +33,9 @@
 //!   Abs 硬件指令。两输入相同（x*x）才匹配，x*y 无简化。L2 norm 的 sqrt(x·x) 常见
 //! - **LogExpToIdentity**：`Log(Exp(x))` → `x`。ln(eˣ)=x，消去 Log+Exp 两个 op。
 //!   代数恒等式重写，ML 场景 x 极少大到 Exp 溢出（f32 阈值约 x>889），默认启用
+//! - **ExpLogToIdentity**：`Exp(Log(x))` → `x`。e^(ln x)=x，LogExpToIdentity 的对偶。
+//!   风险：Log 定义域 x>0，x≤0 时 Log(x)=NaN → Exp(NaN)=NaN，重写后直接得 x（≤0）
+//!   语义有差异。但 ML 场景 Log 输入多为正（softmax 输出、概率、x²+ε），默认启用
 //! - **DivByConstToMul**：`x / c` → `x * (1/c)`。除法 latency 远高于乘法，
 //!   预计算倒数转成乘法。注意：对 c=0 不做；浮点倒数有精度损失但可接受。
 //! - **MulByTwoToAdd**：`x * 2.0` → `x + x`。乘以 2 的幂可用 IEEE754 位级
@@ -125,6 +128,13 @@ pub enum FloatOpt {
         log_node: base::NodeId, // 仅记录，不改 op（输出被重写走，孤儿交 DCE）
         x_input: ValueId,       // Exp 的输入，重写目标
     },
+    /// `Exp(Log(x))` → `x`：e^(ln x)=x，LogExpToIdentity 的对偶。exp_node 仅记录
+    /// （孤儿交 DCE）。风险：Log 定义域 x>0，x≤0 时 Log(x)=NaN → Exp(NaN)=NaN，
+    /// 重写后直接得 x（≤0）——语义有差异。但 ML 场景 Log 输入多为正，默认启用
+    ExpLogToIdentity {
+        exp_node: base::NodeId, // 仅记录，不改 op（输出被重写走，孤儿交 DCE）
+        x_input: ValueId,       // Log 的输入，重写目标
+    },
     /// `Pow(x, 2.0)` → `Mul(x, x)`：x²=x·x，通用幂换便宜乘法（Pow 用 log/exp 实现，贵）
     PowSquareToMul {
         pow_node: base::NodeId, // 主操作节点，改 Mul
@@ -191,6 +201,11 @@ pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
             }
             OpKind::Log => {
                 if let Some(opt) = try_match_log_exp(graph, n)? {
+                    opts.push(opt);
+                }
+            }
+            OpKind::Exp => {
+                if let Some(opt) = try_match_exp_log(graph, n)? {
                     opts.push(opt);
                 }
             }
@@ -478,6 +493,30 @@ fn try_match_log_exp(graph: &Graph, log: NodeView) -> Result<Option<FloatOpt>> {
     }))
 }
 
+/// 识别 `Exp(Log(x))`：Exp 节点，输入(ins[0]) 是 Log 节点输出。
+/// e^(ln x)=x，消去 Exp+Log（LogExpToIdentity 的对偶）。Exp 节点输出被重写到 x，
+/// 节点本身不改 op（孤儿交 DCE）。风险：Log 定义域 x>0，x≤0 时语义有差异（见 enum 注释）
+fn try_match_exp_log(graph: &Graph, exp: NodeView) -> Result<Option<FloatOpt>> {
+    let Some(&y) = exp.inputs().first() else {
+        return Ok(None);
+    };
+    let y_def = graph.value(y)?.def_node();
+    if y_def == u32::MAX {
+        return Ok(None);
+    }
+    let log_node = graph.node(y_def)?;
+    if log_node.kind != OpKind::Log {
+        return Ok(None);
+    }
+    let Some(&x_input) = log_node.inputs().first() else {
+        return Ok(None);
+    };
+    Ok(Some(FloatOpt::ExpLogToIdentity {
+        exp_node: exp.id,
+        x_input,
+    }))
+}
+
 /// 识别 `Pow(x, 2.0)`：Pow 节点，指数输入(ins[1])是常量 2.0。
 /// x²=x·x，把通用 Pow（log/exp 实现的超越函数，贵）换成便宜 Mul。无溢出/NaN 风险
 fn try_match_pow_square(graph: &Graph, pow: NodeView) -> Result<Option<FloatOpt>> {
@@ -753,6 +792,36 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                             let new_outputs: Vec<ValueId> = old_outputs
                                 .iter()
                                 .map(|&v| if v == log_out { x_input } else { v })
+                                .collect();
+                            graph.storage.outputs = new_outputs;
+                        }
+                    }
+                }
+                applied += 1;
+            }
+            FloatOpt::ExpLogToIdentity { exp_node, x_input } => {
+                // Exp(Log(x)) → x：e^(ln x)=x。把 Exp 输出值的所有使用者重写为 x_input
+                // （Log 的输入）。Exp 节点本身不改 op，输出无人用后变孤儿交给 DCE。
+                // 风险：x≤0 时 Log(x)=NaN→Exp(NaN)=NaN，重写后得 x（≤0）语义有差异
+                let exp_outs: Vec<ValueId> = graph.node(exp_node)?.outputs().to_vec();
+                if let Some(&exp_out) = exp_outs.first() {
+                    if exp_out != x_input {
+                        let node_ids: Vec<u32> = graph.node_ids().collect();
+                        for nid in node_ids {
+                            let old_inputs: Vec<ValueId> = graph.node(nid)?.inputs().to_vec();
+                            if old_inputs.contains(&exp_out) {
+                                let new_inputs: Vec<ValueId> = old_inputs
+                                    .iter()
+                                    .map(|&v| if v == exp_out { x_input } else { v })
+                                    .collect();
+                                graph.storage.set_node_inputs(nid, &new_inputs);
+                            }
+                        }
+                        let old_outputs: Vec<ValueId> = graph.outputs().to_vec();
+                        if old_outputs.contains(&exp_out) {
+                            let new_outputs: Vec<ValueId> = old_outputs
+                                .iter()
+                                .map(|&v| if v == exp_out { x_input } else { v })
                                 .collect();
                             graph.storage.outputs = new_outputs;
                         }
@@ -1457,6 +1526,57 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, FloatOpt::LogExpToIdentity { .. })),
             "Log(Sqrt(x)) 不应触发 LogExpToIdentity（输入非 Exp）"
+        );
+    }
+
+    /// `Exp(Log(x))` → `x`：e^(ln x)=x，图输出重写到 x_input，Log 输入仍是 x
+    #[test]
+    fn exp_log_to_identity() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let log = g.add_node(OpKind::Log);
+        let log_out = g.add_value(Type::Scalar(DType::F32), Some("lx"), log);
+        g.storage.set_node_inputs(log, &[x]);
+        g.storage.set_node_outputs(log, &[log_out]);
+        let exp = g.add_node(OpKind::Exp);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), exp);
+        g.storage.set_node_inputs(exp, &[log_out]);
+        g.storage.set_node_outputs(exp, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // 图输出应重写到 x（不再是 exp 的输出 out）
+        assert!(
+            g.outputs().contains(&x),
+            "图输出应重写到 x_input（Log 的输入）"
+        );
+        assert!(!g.outputs().contains(&out), "exp 的输出 out 不应再是图输出");
+        // Log 节点输入仍是 x（apply 不改 Log）
+        assert_eq!(g.node(log).unwrap().inputs(), &[x], "Log 节点输入应仍是 x");
+    }
+
+    /// `Exp(Sqrt(x))`（输入非 Log）不应触发 ExpLogToIdentity
+    #[test]
+    fn exp_non_log_not_matched() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let sqrt_out = g.add_value(Type::Scalar(DType::F32), Some("sx"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[x]);
+        g.storage.set_node_outputs(sqrt, &[sqrt_out]);
+        let exp = g.add_node(OpKind::Exp);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), exp);
+        g.storage.set_node_inputs(exp, &[sqrt_out]);
+        g.storage.set_node_outputs(exp, &[out]);
+        g.mark_output(out);
+
+        let opts = find_opportunities(&g).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, FloatOpt::ExpLogToIdentity { .. })),
+            "Exp(Sqrt(x)) 不应触发 ExpLogToIdentity（输入非 Log）"
         );
     }
 
