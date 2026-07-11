@@ -159,8 +159,17 @@ impl Pass for CsePass {
         "cse"
     }
     fn run(&mut self, graph: &mut Graph, ctx: &mut PassContext) -> Result<()> {
-        let count = cse::apply_cse(graph)?;
-        if count > 0 {
+        // 不动点迭代：CSE 消除节点后使用者 inputs 被重写，可能暴露新的
+        // 公共子表达式机会，循环到无变化。设上限防意外死循环。
+        let mut total = 0usize;
+        for _ in 0..16 {
+            let n = cse::apply_cse(graph)?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        if total > 0 {
             ctx.inc("cse_eliminated");
         }
         Ok(())

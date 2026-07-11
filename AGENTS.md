@@ -430,3 +430,41 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 3. fuse 可扩展：reduce + elementwise 更复杂模式（当前 binary side inputs + reduce 链头已支持）
 4. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）
 5. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）
+
+### 2026-07-11 — CSE IO 识别修三个缺口（feat/neutron-cse-io）
+
+**当前状态**：用户要求做架构无关层的 IO 优化识别（即 CSE，设计哲学"IO 同样性=CSE"）。调研发现 CSE 的"识别"有两个 critical 正确性 bug（不是漏识别，是错误识别=false positive）+ 一个识别能力缺口，全部修完。回归全绿，本分支待合并回 main。
+
+**用户指引**："做IO优化的识别...在架构无关那里先实现基础的io优化，架构相关的以后再看"。理解为：在 optimizer 层做 CSE 识别补强，不动 arch/isel。调研用 1 个 search 子代理摸清 CSE 全貌后发现三个缺口。
+
+**已完成**（2 commit）：
+- **修缺口 A+B：CSE 指纹纳入 attr + 多元素常量指纹塌缩修复**（commit cd81f5c）：
+  - 缺口 A（critical 正确性 bug）：Fingerprint::Op 只编码 (op, inputs) 不含 attr，带 attr 的 op（Reduce Axis / Concat Axis / Transpose Perm / Reshape Shape / Fused Shape+Strides）inputs 相同但 attr 不同时被错误合并。decompose 后大量 ReduceMean/ReduceMax 同输入不同 axis 会误合并，真实可触发。修法：Fingerprint::Op 加第三个字段 attr_hash: u64，新增 attr_fingerprint 辅助遍历节点所有 attr（Int/Float/Bool/IntArray/FloatArray）按 (key, tag, value) 累加成稳定 u64。
+  - 缺口 B（critical 正确性 bug）：多元素常量张量的 constant_value() 返回 None，指纹 unwrap_or(NaN) 塌缩成 NaN.to_bits()，所有多元素常量（如不同 weight 矩阵）被误判相同。修法：fingerprint 改返回 Result<Option<Fingerprint>>，单元素走 Constant(bits)，多元素走 ConstantTensor(dims+values 哈希)，未知常量 None 跳过 CSE（保守不合并）。
+  - 5 新单测：reduce 不同 axis 不合并 / transpose 不同 perm 不合并 / reduce 同 axis 合并（正向）/ 不同多元素常量不合并 / 相同多元素常量合并
+- **修缺口 C：CSE 不动点迭代**（commit 7cf6de2）：CSE 只跑一次，消除节点后使用者 inputs 重写暴露的新"两节点 inputs 相同"机会捕不到（algebra 有不动点，CSE 没有）。修法：CsePass::run 包不动点循环（上限 16 次防意外死循环），循环到 apply_cse 返回 0 收敛。1 新单测 cse_fixpoint_catches_newly_exposed：a=Add(x,y)、b=Add(x,y)（第一轮消除 b）、c=Add(a,b)→Add(a,a)、d=Add(a,a)，单次只消除 1 个，不动点消除 2 个，第三轮收敛。模块注释同步更新。
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：138 passed（base 3 + common 2 + frontend 23 + interface 5 + isel 12 + lisp 4 + optimizer 89）—— 较上轮 132 +6（5 attr/常量单测 + 1 不动点单测）
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
+
+**设计哲学遵守**：CSE 是设计哲学明确点名的"IO 同样性"识别。本轮修的是识别的**正确性**（false positive：带 attr 的 op 和多元素常量被误合并）和**完整性**（不动点捕新机会）。非贪心模式匹配，纯字面相同子表达式合并。保守策略：未知常量不参与 CSE 避免误合并。
+
+**子代理协作模式**：1 个 search 子代理摸清 CSE 全貌（Fingerprint/run_cse/pipeline 注册/单测覆盖/缺口分析），1 个 general_purpose_task 子代理实现缺口 A+B（attr 指纹 + 多元素常量指纹）。缺口 C 改动小（CsePass::run 包循环），主 agent 直接做。主 agent 上下文未爆。
+
+**CSE 识别能力现状**：
+- 指纹完整：(op, normalized_inputs, attr_hash)，可交换 op（Add/Mul）inputs 排序，常量按值/张量内容区分
+- 不动点迭代：消除后暴露的新机会能多捕一层（上限 16 次）
+- 保守跳过：未知常量（非 FLOAT 张量）不参与 CSE
+- pipeline 位置：重排阶段最后（algebra→float_opts→CSE），规范化后做字面匹配
+
+**下一步**（优先级排序）：
+1. pt 前端：PyTorch 解析（frontend 最后一块占位）
+2. fuse 可扩展：reduce + elementwise 更复杂模式（当前 binary side inputs + reduce 链头已支持）
+3. float_opts 可继续：Exp(Log(x))→x 对偶 / Pow(x,3.0) 整数幂扩展
+4. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）
+5. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）
+6. CSE 可选增强：可交换 op 集中管理（改 is_commutative 辅助，当前硬编码 Add|Mul，未来加 Max/Min/Equal 时同步）；等价但非字面相同的 IO（如 x+x 与 x*2，依赖 algebra 规范化，当前 pipeline 顺序已对）
