@@ -29,6 +29,9 @@
 //! - **PowCubeToMul**：`Pow(x, 3.0)` → `Mul(x, Mul(x, x))`。x³=x·x·x，通用幂
 //!   换成两次便宜乘法。新建内层 Mul(x,x) 节点，Pow 节点改外层 Mul 吃 [x, x²]。
 //!   无溢出/NaN 风险（数学完全等价）
+//! - **PowNegTwoToReciprocal**：`Pow(x, -2.0)` → `Reciprocal(Mul(x, x))`。
+//!   x^(-2)=1/x²=reciprocal(x²)，通用幂换成 Mul + Reciprocal（都是单条硬件指令）。
+//!   新建 Mul(x,x)，Pow 改 Reciprocal 吃 [mul_out]。RMSNorm/L2 归一化常见
 //! - **SqrtSquareToAbs**：`Sqrt(x*x)` → `Abs(x)`。√(x²)=|x|，Sqrt+Mul 换单条
 //!   Abs 硬件指令。两输入相同（x*x）才匹配，x*y 无简化。L2 norm 的 sqrt(x·x) 常见
 //! - **LogExpToIdentity**：`Log(Exp(x))` → `x`。ln(eˣ)=x，消去 Log+Exp 两个 op。
@@ -146,6 +149,13 @@ pub enum FloatOpt {
         pow_node: base::NodeId, // 主操作节点（原 Pow），改外层 Mul
         base: ValueId,          // 底数 x，内层和外层 Mul 都用它
     },
+    /// `Pow(x, -2.0)` → `Reciprocal(Mul(x, x))`：x^(-2)=1/x²=reciprocal(x²)。
+    /// 通用幂换成 Mul + Reciprocal（都是单条硬件指令）。新建 Mul(x,x)，
+    /// Pow 改 Reciprocal 吃 [mul_out]。无溢出/NaN 风险（x=0 时原 Pow 也是 inf，重写后 Reciprocal(0)=inf 一致）
+    PowNegTwoToReciprocal {
+        pow_node: base::NodeId, // 主操作节点（原 Pow），改 Reciprocal
+        base: ValueId,          // 底数 x，新建的 Mul(x,x) 用它
+    },
 }
 
 pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
@@ -191,6 +201,9 @@ pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
                     opts.push(opt);
                 }
                 if let Some(opt) = try_match_pow_cube(graph, n)? {
+                    opts.push(opt);
+                }
+                if let Some(opt) = try_match_pow_neg_two(graph, n)? {
                     opts.push(opt);
                 }
             }
@@ -552,6 +565,24 @@ fn try_match_pow_cube(graph: &Graph, pow: NodeView) -> Result<Option<FloatOpt>> 
     Ok(None)
 }
 
+/// 识别 `Pow(x, -2.0)`：Pow 节点，指数输入(ins[1])是常量 -2.0。
+/// x^(-2)=1/x²=reciprocal(x²)，把通用 Pow 换成 Mul + Reciprocal（都是单条硬件指令）。
+/// 注意：指数必须是精确的 -2.0，底数任意（x=0 时 Pow 亦 inf，重写后 Reciprocal(0)=inf 一致）
+fn try_match_pow_neg_two(graph: &Graph, pow: NodeView) -> Result<Option<FloatOpt>> {
+    let ins = pow.inputs();
+    if ins.len() != 2 {
+        return Ok(None);
+    }
+    let (base, exp) = (ins[0], ins[1]);
+    if constant_value(graph, exp)? == Some(-2.0) {
+        return Ok(Some(FloatOpt::PowNegTwoToReciprocal {
+            pow_node: pow.id,
+            base,
+        }));
+    }
+    Ok(None)
+}
+
 fn constant_value(graph: &Graph, v: ValueId) -> Result<Option<f64>> {
     let val = graph.value(v)?;
     let def = val.def_node();
@@ -847,6 +878,20 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                 // Pow 节点改外层 Mul，输入 [x, x²]（即 [base, inner_out]）
                 graph.storage.set_node_inputs(pow_node, &[base, inner_out]);
                 graph.storage.node_hdr[pow_node as usize].op_tag = OpKind::Mul as u8;
+                applied += 1;
+            }
+            FloatOpt::PowNegTwoToReciprocal { pow_node, base } => {
+                // Pow(x, -2.0) → Reciprocal(Mul(x, x))：x^(-2)=1/x²=reciprocal(x²)。
+                // 新建 Mul(x,x) 节点，Pow 节点改 Reciprocal 吃 [mul_out]。
+                // 输出 value 不变（使用者无感），原常量 -2.0 节点变孤儿交 DCE。
+                // x=0 时原 Pow(0,-2)=inf，重写后 Reciprocal(Mul(0,0))=Reciprocal(0)=inf 一致
+                let mul_node = graph.add_node(OpKind::Mul);
+                let mul_out = graph.add_value(type_of_value(graph, base)?, Some("x2"), mul_node);
+                graph.storage.set_node_inputs(mul_node, &[base, base]);
+                graph.storage.set_node_outputs(mul_node, &[mul_out]);
+                // Pow 节点改 Reciprocal，输入 [mul_out]
+                graph.storage.set_node_inputs(pow_node, &[mul_out]);
+                graph.storage.node_hdr[pow_node as usize].op_tag = OpKind::Reciprocal as u8;
                 applied += 1;
             }
         }
@@ -1699,5 +1744,52 @@ mod tests {
         // 输出 shape 保持 [2,3]
         let out_val = g.value(out).unwrap();
         assert_eq!(out_val.shape(), &[2, 3]);
+    }
+
+    /// `Pow(x, -2.0)` → `Reciprocal(Mul(x, x))`：x^(-2)=1/x²，新建 Mul(x,x)，Pow 改 Reciprocal
+    #[test]
+    fn pow_neg_two_to_reciprocal() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, neg_two) = g.add_constant_f64(-2.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, neg_two]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // Pow 节点应改 Reciprocal
+        let n = g.node(pow).unwrap();
+        assert_eq!(n.kind, OpKind::Reciprocal, "Pow(x,-2.0) 应改成 Reciprocal");
+        assert_eq!(n.outputs(), &[out], "输出 value 不变");
+        // Reciprocal 输入应是新建 Mul(x,x) 的输出
+        let mul_out = n.inputs()[0];
+        let mul_def = g.value(mul_out).unwrap().def_node();
+        let mul_node = g.node(mul_def).unwrap();
+        assert_eq!(mul_node.kind, OpKind::Mul, "应新建 Mul(x,x) 节点");
+        assert_eq!(mul_node.inputs(), &[x, x], "Mul 输入应是 [x, x]");
+    }
+
+    /// `Pow(x, -3.0)`（指数非 -2.0）不应触发 PowNegTwoToReciprocal
+    #[test]
+    fn pow_non_neg_two_not_matched() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, neg_three) = g.add_constant_f64(-3.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, neg_three]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let opts = find_opportunities(&g).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, FloatOpt::PowNegTwoToReciprocal { .. })),
+            "Pow(x,-3.0) 不应触发 PowNegTwoToReciprocal"
+        );
     }
 }
