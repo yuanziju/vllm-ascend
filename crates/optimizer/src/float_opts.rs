@@ -26,6 +26,9 @@
 //!   同 PowHalfToSqrt 一类：通用幂 → 专用 op（单条硬件指令）
 //! - **PowSquareToMul**：`Pow(x, 2.0)` → `Mul(x, x)`。x²=x·x，通用幂（用 log/exp
 //!   实现的超越函数，贵）换成便宜乘法。无溢出/NaN 风险（数学完全等价）
+//! - **PowCubeToMul**：`Pow(x, 3.0)` → `Mul(x, Mul(x, x))`。x³=x·x·x，通用幂
+//!   换成两次便宜乘法。新建内层 Mul(x,x) 节点，Pow 节点改外层 Mul 吃 [x, x²]。
+//!   无溢出/NaN 风险（数学完全等价）
 //! - **SqrtSquareToAbs**：`Sqrt(x*x)` → `Abs(x)`。√(x²)=|x|，Sqrt+Mul 换单条
 //!   Abs 硬件指令。两输入相同（x*x）才匹配，x*y 无简化。L2 norm 的 sqrt(x·x) 常见
 //! - **LogExpToIdentity**：`Log(Exp(x))` → `x`。ln(eˣ)=x，消去 Log+Exp 两个 op。
@@ -127,6 +130,12 @@ pub enum FloatOpt {
         pow_node: base::NodeId, // 主操作节点，改 Mul
         base: ValueId,          // 底数 x，两个输入都用它
     },
+    /// `Pow(x, 3.0)` → `Mul(x, Mul(x, x))`：x³=x·x·x，通用幂换两次便宜乘法。
+    /// 新建内层 Mul(x,x)，Pow 节点改外层 Mul 吃 [x, x²]。无溢出/NaN 风险
+    PowCubeToMul {
+        pow_node: base::NodeId, // 主操作节点（原 Pow），改外层 Mul
+        base: ValueId,          // 底数 x，内层和外层 Mul 都用它
+    },
 }
 
 pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
@@ -169,6 +178,9 @@ pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
                     opts.push(opt);
                 }
                 if let Some(opt) = try_match_pow_square(graph, n)? {
+                    opts.push(opt);
+                }
+                if let Some(opt) = try_match_pow_cube(graph, n)? {
                     opts.push(opt);
                 }
             }
@@ -483,6 +495,24 @@ fn try_match_pow_square(graph: &Graph, pow: NodeView) -> Result<Option<FloatOpt>
     Ok(None)
 }
 
+/// 识别 `Pow(x, 3.0)`：Pow 节点，指数输入(ins[1])是常量 3.0。
+/// x³=x·x·x，把通用 Pow 换成两次便宜 Mul。无溢出/NaN 风险（数学完全等价）。
+/// 注意：指数必须是精确的 3.0（不匹配 3.0001 等），底数任意
+fn try_match_pow_cube(graph: &Graph, pow: NodeView) -> Result<Option<FloatOpt>> {
+    let ins = pow.inputs();
+    if ins.len() != 2 {
+        return Ok(None);
+    }
+    let (base, exp) = (ins[0], ins[1]);
+    if constant_value(graph, exp)? == Some(3.0) {
+        return Ok(Some(FloatOpt::PowCubeToMul {
+            pow_node: pow.id,
+            base,
+        }));
+    }
+    Ok(None)
+}
+
 fn constant_value(graph: &Graph, v: ValueId) -> Result<Option<f64>> {
     let val = graph.value(v)?;
     let def = val.def_node();
@@ -734,6 +764,19 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                 // Pow(x, 2.0) → Mul(x, x)：Pow 节点改 Mul，输入换 [x, x]（两输入都是 base），
                 // 丢弃常量指数 2.0。输出 value 不变（使用者无感），原常量 2.0 节点变孤儿交 DCE
                 graph.storage.set_node_inputs(pow_node, &[base, base]);
+                graph.storage.node_hdr[pow_node as usize].op_tag = OpKind::Mul as u8;
+                applied += 1;
+            }
+            FloatOpt::PowCubeToMul { pow_node, base } => {
+                // Pow(x, 3.0) → Mul(x, Mul(x, x))：x³=x·x·x。
+                // 新建内层 Mul(x,x) 节点，Pow 节点改外层 Mul 吃 [x, inner_mul_out]。
+                // 输出 value 不变（使用者无感），原常量 3.0 节点变孤儿交 DCE
+                let inner_mul = graph.add_node(OpKind::Mul);
+                let inner_out = graph.add_value(type_of_value(graph, base)?, Some("x2"), inner_mul);
+                graph.storage.set_node_inputs(inner_mul, &[base, base]);
+                graph.storage.set_node_outputs(inner_mul, &[inner_out]);
+                // Pow 节点改外层 Mul，输入 [x, x²]（即 [base, inner_out]）
+                graph.storage.set_node_inputs(pow_node, &[base, inner_out]);
                 graph.storage.node_hdr[pow_node as usize].op_tag = OpKind::Mul as u8;
                 applied += 1;
             }
@@ -1456,5 +1499,85 @@ mod tests {
                 .any(|o| matches!(o, FloatOpt::PowSquareToMul { .. })),
             "Pow(x,3.0) 不应触发 PowSquareToMul"
         );
+    }
+
+    /// `Pow(x, 3.0)` → `Mul(x, Mul(x, x))`：x³=x·x·x，新建内层 Mul(x,x)，Pow 改外层 Mul
+    #[test]
+    fn pow_cube_to_mul() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, three) = g.add_constant_f64(3.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, three]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // Pow 节点应改外层 Mul
+        let n = g.node(pow).unwrap();
+        assert_eq!(n.kind, OpKind::Mul, "Pow(x,3.0) 应改成外层 Mul");
+        assert_eq!(n.outputs(), &[out], "输出 value 不变");
+        // 外层 Mul 输入 [x, inner_out]
+        let outer_ins = n.inputs();
+        assert_eq!(outer_ins[0], x, "外层 Mul 第一个输入应是 x");
+        let inner_out = outer_ins[1];
+        let inner_def = g.value(inner_out).unwrap().def_node();
+        let inner_node = g.node(inner_def).unwrap();
+        assert_eq!(inner_node.kind, OpKind::Mul, "应新建内层 Mul 节点");
+        assert_eq!(inner_node.inputs(), &[x, x], "内层 Mul 输入应是 [x, x]");
+    }
+
+    /// `Pow(x, 4.0)`（指数非 3.0）不应触发 PowCubeToMul
+    #[test]
+    fn pow_non_three_not_matched() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, four) = g.add_constant_f64(4.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, four]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let opts = find_opportunities(&g).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, FloatOpt::PowCubeToMul { .. })),
+            "Pow(x,4.0) 不应触发 PowCubeToMul"
+        );
+    }
+
+    /// `Pow(x, 3.0)` 张量模式：shape 正确传递
+    #[test]
+    fn pow_cube_tensor_preserves_shape() {
+        let mut g = Graph::new("test");
+        let ty = Type::Tensor {
+            dtype: DType::F32,
+            dims: vec![2, 3],
+        };
+        let x = g.add_input(ty.clone(), Some("x"));
+        let (_c, three) = g.add_constant_f64(3.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(ty.clone(), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, three]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let n = g.node(pow).unwrap();
+        assert_eq!(n.kind, OpKind::Mul);
+        // 内层 Mul 也应是张量 shape
+        let inner_out = n.inputs()[1];
+        let inner_def = g.value(inner_out).unwrap().def_node();
+        let inner_node = g.node(inner_def).unwrap();
+        assert_eq!(inner_node.kind, OpKind::Mul);
+        assert_eq!(inner_node.inputs(), &[x, x]);
+        // 输出 shape 保持 [2,3]
+        let out_val = g.value(out).unwrap();
+        assert_eq!(out_val.shape(), &[2, 3]);
     }
 }
