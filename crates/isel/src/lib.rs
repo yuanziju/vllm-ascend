@@ -9,20 +9,39 @@
 //! ```
 //! - `when` 条件是 lisp 表达式，求值为非 nil/非 false 时触发
 //! - 求值时绑定变量：`op`（op 名字符串）、`idx`（节点序号）、`target`（目标架构字符串）
-//! - `emit` 的参数是 lisp 表达式，求值后拼成指令的 op + args
+//! - `emit` 的参数是 lisp 表达式，第一个求值结果作指令 op 名，其余（"r0"/"r1" 等占位符）
+//!   解析后丢弃——真实 operand 由 select_with_rules 从 ArchOp 的 ValueId 分配 VReg 填充
 //!
 //! 例：`(rule (when (= op "add")) (emit "fadd" "r0" "r1"))`
 //! 例：`(rule (when (and (= op "mma") (= target "cuda"))) (emit "wgmma" "a" "b"))`
 
+use std::collections::HashMap;
+
 use arch::{ArchGraph, ArchOp};
-use base::{NeutronError, Result};
+use base::{NeutronError, Result, ValueId};
 use lisp::{parse, Interp, Val};
 
-/// 最终指令
+/// 虚拟寄存器 ID（u32 索引，由 isel 分配，待 regalloc 映射到物理寄存器）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VReg(pub u32);
+
+/// 指令 operand：虚拟寄存器或立即数
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Operand {
+    /// 虚拟寄存器（def-use chain 节点，待 regalloc 分配物理寄存器）
+    VReg(VReg),
+    /// 立即数（常量，不占寄存器）
+    Imm(f64),
+}
+
+/// 最终指令（带虚拟寄存器 operand，支撑寄存器分配的 def-use 追踪）
 #[derive(Debug, Clone)]
 pub struct Instruction {
     pub op: String,
-    pub args: Vec<String>,
+    /// 输入 operand 列表（VReg 或 Imm）
+    pub inputs: Vec<Operand>,
+    /// 输出 VReg 列表（指令 def 的虚拟寄存器）
+    pub outputs: Vec<VReg>,
 }
 
 /// 一条 isel 规则
@@ -255,9 +274,13 @@ fn select_one(
             parts.push(val_to_str(&v));
         }
         let instr_op = parts.remove(0);
+        // emit 的 args（"r0"/"r1" 等占位字符串）解析后丢弃——真实 operand 由
+        // select_with_rules 从 ArchOp 的 ValueId 分配 VReg 填充（寄存器分配
+        // 需要可追踪的 def-use chain，而非字面占位符）
         return Ok(Some(Instruction {
             op: instr_op,
-            args: parts,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
         }));
     }
     Ok(None)
@@ -268,18 +291,50 @@ pub fn select(arch_graph: &ArchGraph) -> Result<Vec<Instruction>> {
     select_with_rules(arch_graph, &default_rules())
 }
 
-/// 用自定义规则集选择指令
+/// 分配/复用虚拟寄存器：ValueId 已在 map 中则复用（同一 def-use chain 节点），
+/// 否则分配新 VReg。SSA 下每个 ValueId 恰被定义一次，故 output ValueId 总是新 def。
+fn alloc_vreg(vid: ValueId, map: &mut HashMap<ValueId, VReg>, next: &mut u32) -> VReg {
+    if let Some(&v) = map.get(&vid) {
+        v
+    } else {
+        let v = VReg(*next);
+        *next += 1;
+        map.insert(vid, v);
+        v
+    }
+}
+
+/// 用自定义规则集选择指令，维护 ValueId→VReg 映射
 pub fn select_with_rules(arch_graph: &ArchGraph, rules: &[Rule]) -> Result<Vec<Instruction>> {
     let target = format!("{:?}", arch_graph.target).to_lowercase();
     let mut instrs = Vec::new();
+    let mut vreg_map: HashMap<ValueId, VReg> = HashMap::new();
+    let mut next_vreg: u32 = 0;
     for (i, op) in arch_graph.ops.iter().enumerate() {
-        let op_name = match op {
-            ArchOp::KernelCall { name, .. } => name.as_str(),
-            ArchOp::Load { .. } => "load",
-            ArchOp::Store { .. } => "store",
+        // 取 op 名 + 输入/输出 ValueId 列表（ArchOp 已携带，前置缺口1）
+        let (op_name, inputs_vids, outputs_vids): (&str, &[ValueId], &[ValueId]) = match op {
+            ArchOp::KernelCall {
+                name,
+                inputs,
+                outputs,
+            } => (name.as_str(), inputs, outputs),
+            ArchOp::Load { addr, dst } => ("load", &[*addr][..], &[*dst][..]),
+            ArchOp::Store { addr, src } => ("store", &[*addr, *src][..], &[][..]),
         };
         match select_one(op_name, i, &target, rules)? {
-            Some(ins) => instrs.push(ins),
+            Some(mut ins) => {
+                // 用 ArchOp 的 ValueId 填充 Instruction 的 operand：
+                // inputs 复用已有 VReg（def-use chain），outputs 分配新 VReg（新 def）
+                ins.inputs = inputs_vids
+                    .iter()
+                    .map(|&v| Operand::VReg(alloc_vreg(v, &mut vreg_map, &mut next_vreg)))
+                    .collect();
+                ins.outputs = outputs_vids
+                    .iter()
+                    .map(|&v| alloc_vreg(v, &mut vreg_map, &mut next_vreg))
+                    .collect();
+                instrs.push(ins);
+            }
             None => {
                 return Err(NeutronError::Isel(format!(
                     "无规则匹配 op: {:?}（idx {}）",
@@ -334,7 +389,10 @@ mod tests {
         let instrs = select(&ag).unwrap();
         assert_eq!(instrs.len(), 1);
         assert_eq!(instrs[0].op, "fadd");
-        assert_eq!(instrs[0].args, vec!["r0", "r1"]);
+        // ArchOp 无 inputs/outputs → Instruction 的 inputs/outputs 为空
+        // （真实 operand 由 select_with_rules 从 ValueId 填充）
+        assert!(instrs[0].inputs.is_empty());
+        assert!(instrs[0].outputs.is_empty());
     }
 
     #[test]
@@ -349,7 +407,93 @@ mod tests {
         );
         let instrs = select(&ag).unwrap();
         assert_eq!(instrs[0].op, "mma");
-        assert_eq!(instrs[0].args, vec!["a", "b", "c"]);
+        assert!(instrs[0].inputs.is_empty());
+        assert!(instrs[0].outputs.is_empty());
+    }
+
+    #[test]
+    fn vreg_mapping_tracks_def_use() {
+        // 两条 add 指令的 def-use chain：
+        //   op0: add(v10, v11) -> v12   （v10/v11 是 graph 输入，v12 新 def）
+        //   op1: add(v12, v10) -> v13   （v12 复用 op0 的输出 VReg，v10 复用，v13 新 def）
+        // VReg 分配应为：v10→VReg(0), v11→VReg(1), v12→VReg(2), v13→VReg(3)
+        // op1 的第一个 input 应复用 op0 的 output VReg(2)——这正是寄存器分配
+        // 追踪 def-use chain 所需的真实 operand 关系（旧 args 字面 "r0"/"r1" 无法表达）
+        let ag = make_arch(
+            Target::Cuda,
+            vec![
+                ArchOp::KernelCall {
+                    name: "add".into(),
+                    inputs: vec![10, 11],
+                    outputs: vec![12],
+                },
+                ArchOp::KernelCall {
+                    name: "add".into(),
+                    inputs: vec![12, 10],
+                    outputs: vec![13],
+                },
+            ],
+        );
+        let instrs = select(&ag).unwrap();
+        assert_eq!(instrs.len(), 2);
+
+        // op0：inputs=[VReg(0), VReg(1)]，outputs=[VReg(2)]
+        assert_eq!(instrs[0].inputs.len(), 2);
+        assert_eq!(instrs[0].outputs.len(), 1);
+        let out0 = instrs[0].outputs[0];
+        assert_eq!(out0, VReg(2));
+        match instrs[0].inputs[0] {
+            Operand::VReg(v) => assert_eq!(v, VReg(0)),
+            Operand::Imm(_) => panic!("input 应是 VReg"),
+        }
+
+        // op1：inputs=[VReg(2)(复用 op0 输出), VReg(0)(复用 v10)]，outputs=[VReg(3)]
+        assert_eq!(instrs[1].inputs.len(), 2);
+        assert_eq!(instrs[1].outputs.len(), 1);
+        assert_eq!(instrs[1].outputs[0], VReg(3));
+        match instrs[1].inputs[0] {
+            Operand::VReg(v) => {
+                assert_eq!(v, out0, "v12 应复用 op0 的输出 VReg（def-use chain 衔接）")
+            }
+            Operand::Imm(_) => panic!("input 应是 VReg"),
+        }
+        match instrs[1].inputs[1] {
+            Operand::VReg(v) => assert_eq!(v, VReg(0), "v10 应复用 op0 的 input VReg"),
+            Operand::Imm(_) => panic!("input 应是 VReg"),
+        }
+    }
+
+    #[test]
+    fn load_store_vreg_operands() {
+        // Load: input=[addr], output=[dst]；Store: input=[addr, src], output=[]
+        let ag = make_arch(
+            Target::Cpu,
+            vec![
+                ArchOp::Load { addr: 0, dst: 1 },
+                ArchOp::Store { addr: 0, src: 1 },
+            ],
+        );
+        let instrs = select(&ag).unwrap();
+        assert_eq!(instrs[0].op, "load");
+        assert_eq!(instrs[1].op, "store");
+        // load: 1 input (addr=0→VReg(0)), 1 output (dst=1→VReg(1))
+        assert_eq!(instrs[0].inputs.len(), 1);
+        assert_eq!(instrs[0].outputs.len(), 1);
+        // store: 2 inputs (addr=0→复用 VReg(0), src=1→复用 VReg(1)), 0 outputs
+        assert_eq!(instrs[1].inputs.len(), 2);
+        assert!(instrs[1].outputs.is_empty());
+        // store 的 addr 应复用 load 的 addr VReg（同一 ValueId 0）
+        match (instrs[0].inputs[0], instrs[1].inputs[0]) {
+            (Operand::VReg(a), Operand::VReg(b)) => assert_eq!(a, b, "addr VReg 应复用"),
+            _ => panic!("addr 应是 VReg"),
+        }
+        // store 的 src 应复用 load 的 dst VReg（同一 ValueId 1）
+        match (instrs[0].outputs[0], instrs[1].inputs[1]) {
+            (load_dst, Operand::VReg(store_src)) => {
+                assert_eq!(load_dst, store_src, "dst/src VReg 应复用（def-use）")
+            }
+            _ => panic!("dst/src 应是 VReg"),
+        }
     }
 
     #[test]

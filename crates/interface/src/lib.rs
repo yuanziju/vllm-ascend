@@ -66,7 +66,10 @@ pub fn compile(input: Input, config: Config) -> Result<Output> {
             instructions.len()
         ));
         for (i, ins) in instructions.iter().enumerate() {
-            debug.push_str(&format!("  [{}] {} {}\n", i, ins.op, ins.args.join(" ")));
+            debug.push_str(&format!(
+                "  [{}] {} {:?} -> {:?}\n",
+                i, ins.op, ins.inputs, ins.outputs
+            ));
         }
     }
 
