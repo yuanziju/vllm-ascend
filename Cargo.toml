@@ -10,6 +10,7 @@ members = [
     "crates/isel",
     "crates/interface",
     "crates/cli",
+    "crates/regalloc",
 ]
 
 [workspace.package]

@@ -1,0 +1,11 @@
+[package]
+name = "regalloc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+base = { path = "../base" }
+common = { path = "../common" }
+arch = { path = "../arch" }
+isel = { path = "../isel" }
+thiserror = "1.0"
