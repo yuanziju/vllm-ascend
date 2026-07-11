@@ -549,3 +549,54 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 5. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）
 6. CSE 可选：可交换 op 集中管理 / 等价非字面 IO 识别（依赖 algebra 规范化）
 7. float_opts 边界：Pow 系列（±0.5/-1/2/3/-2）已覆盖 ML 主要场景，进一步扩展收益递减
+
+### 2026-07-11 — regalloc crate 图着色寄存器分配器（feat/neutron-regalloc）
+
+**当前状态**：用户要求"最好的寄存器分配，去研究，先给个最终目标"→"找个最好的融合方案放到最高质量的模式"→"你倒是干活啊"。调研（VERILOCC/RL4ReAl/GNN-based/LLVM greedy+pbqp）后选定 Chaitin-Briggs 图着色 + 保守合并 + 分段溢出的融合方案，新建 regalloc crate 实现并集成到 compile pipeline。回归全绿，本分支待合并回 main。
+
+**用户指引**：用户要"最好的融合方案放到最高质量的模式"，理解为不要单一算法，要综合各流派优点（图着色精确性 + 活跃区间精确性 + 保守合并不引入新溢出 + 分段溢出降低代价）。研究阶段用 WebSearch 调研，实现阶段主 agent 直接做。
+
+**已完成**（1 commit）：
+- **regalloc: 图着色寄存器分配器（Chaitin-Briggs + 保守合并 + 分段溢出）**（commit 2db1865）：
+  - 新建 7 文件 regalloc crate（Cargo.toml + lib.rs + types/liveness/interference/coalescing/coloring/allocator 6 模块），1851 行
+  - **types**：VReg(u32)/PReg(u32)/Operand enum/MachineInstr（op+operands+defs+args）/RegisterFile（for_target: CUDA=30/NPU=31/CPU=13 allocatable）/Allocation。7 单测
+  - **liveness**：LiveInterval [start,end]，overlaps 用 >=（同指令 use+def 视为干扰，保守正确）。analyze 遍历 MachineInstr 记录每个 VReg 的 [def, last_use]，图输入值区间从 0 起。6 单测
+  - **interference**：InterferenceGraph 邻接表，O(V²) build 遍历所有 VReg 对。**关键：move 例外**——build 接收 instructions 参数，识别 move 对 (src,dst)，若重叠区间仅单条指令（=move 本身）不加干扰边，允许 coalescing 合并。5 单测
+  - **coalescing**：保守 Briggs 合并，合并后度数 < threshold=3 才合并（不引入新溢出）。combined_degree = neighbors(src)∪neighbors(dst) 中既非 src 也非 dst 的节点数。被合并的 dst 从图移除。5 单测
+  - **coloring**：Chaitin-Briggs 两阶段——Phase1 simplify（度数<K 入栈）+ spill（全部≥K 时溢出代价最低的，cost=(uses+1)/interval_len 密度低优先）；Phase2 select（栈弹出贪心分配最小可用颜色）。5 单测
+  - **allocator**：串联 1→5（liveness→interference→coalesce→color→spill rewrite）。溢出重写：被溢出 VReg 在 def 后插 store_spill、use 前插 load_spill（分段溢出，PReg(0) 作临时寄存器）。被合并的 move 指令跳过（冗余消除）。5 单测
+  - **interface 集成**：compile() 在 isel 后加 regalloc 步骤，Output 新增 machine_instructions/reg_assignment/spilled 字段。2 端到端单测（regalloc_produces_valid_assignment + regalloc_assigns_all_vregs 验证所有 VReg 被分配或溢出、干扰 VReg 不分到同一 PReg）
+
+**move 例外是本轮关键正确性点**：mov v0→v1 时 v0（src）在 move 指令被 use，v1（dst）在 move 指令被 def，二者在 move 指令同时活跃。若用 >= 判定重叠则 v0/v1 干扰→coalescing 跳过→move 无法消除。标准 Chaitin 解法：move 的 src/dst 不互相干扰（可共用寄存器，coalescing 合并后 move 变 no-op）。build 识别 move 对，单点重叠（仅 move 那条指令）不加干扰边。多指令重叠（src/dst 在 move 之外也同时活跃）仍加边（真实干扰，不能共用）。
+
+**修复的 bug**（实现过程）：
+1. LiveInterval::overlaps 最初用严格 >（同指令 use+def 不干扰，错误），改 >=
+2. interference.rs 的 neighbors() 用 unsafe 指针操作（HashSet 无 as_slice）有 UB，删除改用 neighbor_set() 返回 &HashSet（节点存在不变式用 expect 明确）
+3. build_interference 命名不匹配（interface 测试调用，实际导出名是 build）→ 改测试用 regalloc::build
+4. spill_cost_favors_low_use 测试 setup 让 v1 密度更高（use_count/interval 反而更贵），重设为 v1 单次 use 长区间→密度低→cost 低
+5. clippy: LiveInterval 加 is_empty（len_without_is_empty）/ InterferenceGraph 加 Default impl（new_without_default）
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：193 passed（base 3 + common 2 + frontend 23 + interface 7 + isel 12 + lisp 4 + optimizer 106 + regalloc 35）—— 较上轮 158 +35（regalloc 单测）
+
+**设计哲学遵守**：regalloc 在 isel 之后独立 crate，不修改 isel/arch（架构相关层只做 lowering+isel，寄存器分配是 isel 后的通用阶段）。算法是教科书 Chaitin-Briggs（非贪心模式匹配），保守合并保证不引入新溢出（correctness over performance）。
+
+**regalloc 当前能力边界**：
+- VReg 分配：lower_to_machine 遍历 IR Graph 值流，图输入值优先分配 VReg，每个节点 inputs/outputs 分配新 VReg
+- 干扰图：O(V²) 区间重叠 + move 例外（单点重叠=move 不加边）
+- 合并：保守 Briggs（threshold=3），合并后度数 < threshold 才合并
+- 着色：simplify+spill+select，溢出代价=密度（uses+1）/interval_len
+- 溢出：分段溢出（def 后 store_spill + use 前 load_spill），PReg(0) 临时寄存器
+- move 消除：被合并的 move 指令跳过
+
+**下一步**（优先级排序）：
+1. regalloc 增强：live-out 精确干扰（当前区间近似，move 例外是补丁；标准做法是每条指令算 live-out 集合，move src/dst 不互相干扰）
+2. regalloc 增强：spill code 位置优化（当前 def 后立即 store，可延迟到首次溢出 use 前）
+3. regalloc 增强：rematerialization（常量/地址计算类 VReg 溢出时不 store/load 而是原地重算）
+4. pt 前端：PyTorch 解析（TorchScript pickle 太复杂，维持占位；可走 ONNX export 路线）
+5. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）
+6. Slice no-op 识别：需先补 AttrKey::Starts/Ends/Axes/Steps + frontend 解析 Slice 属性
+7. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型
