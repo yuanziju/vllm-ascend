@@ -7,6 +7,10 @@ pub struct CostCoeffs {
     pub flops: f64,
     pub mem: f64,
     pub launch: f64,
+    /// 融合后 Fused kernel 的单 op 寄存器压力系数（反融合判定）。
+    /// 融合 N 个 op 额外代价 ≈ (N-1) * fuse_overhead，模拟寄存器占用增长
+    /// 导致的发射速率下降 / spill 风险。GPU 寄存器紧张取高值，CPU 取低值。
+    pub fuse_overhead: f64,
 }
 
 impl CostCoeffs {
@@ -15,6 +19,8 @@ impl CostCoeffs {
             flops: 1.0,
             mem: 2.5,
             launch: 10.0,
+            // GPU 寄存器紧张，长链易 spill
+            fuse_overhead: 0.5,
         }
     }
     pub fn npu() -> Self {
@@ -22,6 +28,7 @@ impl CostCoeffs {
             flops: 0.8,
             mem: 2.0,
             launch: 5.0,
+            fuse_overhead: 0.3,
         }
     }
     pub fn cpu() -> Self {
@@ -29,6 +36,8 @@ impl CostCoeffs {
             flops: 1.0,
             mem: 1.0,
             launch: 0.0,
+            // CPU 寄存器压力小
+            fuse_overhead: 0.1,
         }
     }
     pub fn for_target(target: common::Target) -> Self {
@@ -164,18 +173,23 @@ pub fn fusion_saving(graph: &Graph, nodes: &[base::NodeId], coeffs: CostCoeffs) 
     if nodes.len() < 2 {
         return Ok(0.0);
     }
-    let saved_launch = (nodes.len() - 1) as f64 * coeffs.launch;
+    let cnt = nodes.len() as f64;
+    let saved_launch = (cnt - 1.0) * coeffs.launch;
     let mut mid_bytes = 0.0;
     for &id in &nodes[..nodes.len() - 1] {
-        let n = graph.node(id)?;
-        for &vout in n.outputs() {
+        let nd = graph.node(id)?;
+        for &vout in nd.outputs() {
             if let Ok(v) = graph.value(vout) {
                 mid_bytes += value_bytes(v) as f64;
             }
         }
     }
     let saved_mem = mid_bytes * 2.0 * coeffs.mem;
-    Ok(saved_launch + saved_mem)
+    // 反融合：融合后 Fused kernel 的额外代价（寄存器压力近似）
+    // 每多融一个 op 增加寄存器占用，超过阈值可能 spill。用线性近似：
+    // extra = (n - 1) * fuse_overhead_per_op
+    let extra = (cnt - 1.0) * coeffs.fuse_overhead;
+    Ok(saved_launch + saved_mem - extra)
 }
 
 #[cfg(test)]
@@ -237,5 +251,75 @@ mod tests {
         g.storage.set_node_outputs(mm, &[out]);
         let cost = estimate_op(&g, g.node(mm).unwrap()).unwrap();
         assert_eq!(cost.flops, 1024.0, "非方阵 MatMul 应用 m·n·k 而非方阵估计");
+    }
+
+    #[test]
+    fn fusion_saving_subtracts_overhead() {
+        // 构造 3 节点 elementwise 链：relu(x) -> sigmoid(.) -> tanh(.)
+        // 验证 fusion_saving = saved_launch + saved_mem - extra（不是单纯 saved_launch + saved_mem）
+        let mut g = Graph::new("test");
+        let x = g.add_input(tensor(vec![4]), Some("x"));
+        let relu = g.add_node(OpKind::Relu);
+        let r_out = g.add_value(tensor(vec![4]), Some("r"), relu);
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[r_out]);
+        let sig = g.add_node(OpKind::Sigmoid);
+        let s_out = g.add_value(tensor(vec![4]), Some("s"), sig);
+        g.storage.set_node_inputs(sig, &[r_out]);
+        g.storage.set_node_outputs(sig, &[s_out]);
+        let tanh = g.add_node(OpKind::Tanh);
+        let t_out = g.add_value(tensor(vec![4]), Some("t"), tanh);
+        g.storage.set_node_inputs(tanh, &[s_out]);
+        g.storage.set_node_outputs(tanh, &[t_out]);
+
+        let coeffs = CostCoeffs::cuda();
+        let nodes = [relu, sig, tanh];
+        let saving = fusion_saving(&g, &nodes, coeffs).unwrap();
+
+        // 手算：
+        // n = 3, saved_launch = (3-1) * 10.0 = 20.0
+        // mid_bytes = r_out(4*4=16) + s_out(16) = 32
+        // saved_mem = 32 * 2.0 * 2.5 = 160.0
+        // extra = (3-1) * 0.5 = 1.0  ← 反融合扣除
+        // total = 20.0 + 160.0 - 1.0 = 179.0
+        assert!(
+            (saving - 179.0).abs() < 1e-6,
+            "fusion_saving 应扣除 overhead，期望 179.0，实际 {}",
+            saving
+        );
+    }
+
+    #[test]
+    fn fusion_saving_long_chain_can_be_negative() {
+        // 长链 + 高 overhead 时，fusion_saving 可能为负（反融合判定生效）
+        // 用 CPU coeffs（launch=0，消除 launch 收益）+ 极高 overhead 模拟 spill 风险
+        let mut g = Graph::new("test");
+        let x = g.add_input(tensor(vec![1]), Some("x"));
+        let mut prev = x;
+        let mut nodes = vec![];
+        for i in 0..20 {
+            let relu = g.add_node(OpKind::Relu);
+            let name = format!("r{}", i);
+            let out = g.add_value(tensor(vec![1]), Some(name.as_str()), relu);
+            g.storage.set_node_inputs(relu, &[prev]);
+            g.storage.set_node_outputs(relu, &[out]);
+            prev = out;
+            nodes.push(relu);
+        }
+        // launch=0（无 launch 收益），mem=1.0，fuse_overhead=100.0（极高）
+        let coeffs = CostCoeffs {
+            flops: 1.0,
+            mem: 1.0,
+            launch: 0.0,
+            fuse_overhead: 100.0,
+        };
+        let saving = fusion_saving(&g, &nodes, coeffs).unwrap();
+        // 手算：saved_launch=0, mid_bytes=19*4=76, saved_mem=76*2*1=152
+        // extra = 19 * 100 = 1900 → saving = 0 + 152 - 1900 = -1748 < 0
+        assert!(
+            saving < 0.0,
+            "高 overhead 长链 fusion_saving 应为负（反融合），实际 {}",
+            saving
+        );
     }
 }
