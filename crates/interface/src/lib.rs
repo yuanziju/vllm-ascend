@@ -16,6 +16,8 @@ pub enum Input {
 pub struct Output {
     pub target: String,
     pub instructions: Vec<Instruction>,
+    /// 寄存器分配结果：VReg→PReg 映射 + spilled 列表
+    pub allocation: regalloc::Allocation,
     pub debug: Option<String>,
 }
 
@@ -73,9 +75,29 @@ pub fn compile(input: Input, config: Config) -> Result<Output> {
         }
     }
 
+    // 5. 寄存器分配（VReg→PReg 映射，不改写 IR）
+    let allocation = regalloc::allocate(&instructions, &arch_graph, config.regalloc_mode)
+        .map_err(|e| base::NeutronError::RegAlloc(e.to_string()))?;
+
+    if config.dump_ir {
+        debug.push_str(&format!(
+            "\n// === 寄存器分配 (mode={:?}, {} vreg 映射, {} spilled) ===\n",
+            config.regalloc_mode,
+            allocation.vreg_to_preg.len(),
+            allocation.spilled.len()
+        ));
+        for (vreg, preg) in &allocation.vreg_to_preg {
+            debug.push_str(&format!("  v{} -> r{}\n", vreg.0, preg.0));
+        }
+        for vreg in &allocation.spilled {
+            debug.push_str(&format!("  v{} -> [spill]\n", vreg.0));
+        }
+    }
+
     Ok(Output {
         target: format!("{:?}", config.target).to_lowercase(),
         instructions,
+        allocation,
         debug: if config.dump_ir { Some(debug) } else { None },
     })
 }
@@ -83,6 +105,7 @@ pub fn compile(input: Input, config: Config) -> Result<Output> {
 // 重导出 common::Config 让外部用
 pub use common::Config;
 pub use common::{OptLevel, Target};
+pub use regalloc::Allocation;
 
 #[cfg(test)]
 mod tests {

@@ -31,6 +31,8 @@ pub enum NeutronError {
     Backend(String),
     #[error("指令选择错误: {0}")]
     Isel(String),
+    #[error("寄存器分配错误: {0}")]
+    RegAlloc(String),
     #[error("Lisp 解释器错误: {0}")]
     Lisp(String),
     #[error("其他: {0}")]

@@ -13,3 +13,4 @@ frontend = { workspace = true }
 optimizer = { workspace = true }
 arch = { workspace = true }
 isel = { workspace = true }
+regalloc = { path = "../regalloc" }
