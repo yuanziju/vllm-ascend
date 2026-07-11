@@ -8,6 +8,7 @@ members = [
     "crates/arch",
     "crates/lisp",
     "crates/isel",
+    "crates/regalloc",
     "crates/interface",
     "crates/cli",
 ]
@@ -27,6 +28,7 @@ optimizer = { path = "crates/optimizer" }
 arch = { path = "crates/arch" }
 lisp = { path = "crates/lisp" }
 isel = { path = "crates/isel" }
+regalloc = { path = "crates/regalloc" }
 interface = { path = "crates/interface" }
 thiserror = "1"
 tracing = "0.1"
