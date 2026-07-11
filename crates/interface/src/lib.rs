@@ -370,4 +370,72 @@ mod tests {
             "isel 应为 Rsqrt 选出 'rsqrt' 指令"
         );
     }
+
+    /// `relu(x) -> ReduceSum(., axis=1)`：elementwise→reduce 融合全链路。
+    /// 验证 O2 pipeline 把 relu+ReduceSum 融成 Fused（reduce 作为链尾），
+    /// lowering 发 "fused" kernel，isel 选 "fused" 指令——证明 Fused op_seq
+    /// 含尾部 reduce 时全链路不崩
+    #[test]
+    fn elementwise_reduce_pipeline_fuses() {
+        use base::{Graph, OpKind, Type};
+        let mut graph = Graph::new("elem_reduce");
+        let ty = Type::Tensor {
+            dtype: base::DType::F32,
+            dims: vec![4, 8],
+        };
+        let x = graph.add_input(ty.clone(), Some("x"));
+        let relu = graph.add_node(OpKind::Relu);
+        let r_out = graph.add_value(ty.clone(), Some("r"), relu);
+        graph.storage.set_node_inputs(relu, &[x]);
+        graph.storage.set_node_outputs(relu, &[r_out]);
+        let rs = graph.add_node(OpKind::ReduceSum);
+        let out_ty = Type::Tensor {
+            dtype: base::DType::F32,
+            dims: vec![4],
+        };
+        let out = graph.add_value(out_ty, Some("out"), rs);
+        graph.storage.set_node_inputs(rs, &[r_out]);
+        graph.storage.set_node_outputs(rs, &[out]);
+        graph
+            .storage
+            .add_attr_int(rs, base::StorageAttrKey::Axis, 1);
+        graph.mark_output(out);
+
+        let mut pm = optimizer::PassManager::default_for(OptLevel::O2, Target::Cuda);
+        pm.run(&mut graph).unwrap();
+
+        // 应产生 Fused 节点（relu+ReduceSum 融合，reduce 作为链尾）
+        let has_fused = graph.node_ids().any(|id| {
+            graph
+                .node(id)
+                .map(|n| n.kind == base::OpKind::Fused)
+                .unwrap_or(false)
+        });
+        assert!(has_fused, "relu→ReduceSum 应融合成 Fused 节点");
+        // Fused 节点应保留 reduce 的 axis attr
+        let fused_id = graph
+            .node_ids()
+            .find(|id| {
+                graph
+                    .node(*id)
+                    .map(|n| n.kind == base::OpKind::Fused)
+                    .unwrap_or(false)
+            })
+            .unwrap();
+        let has_axis = graph
+            .node(fused_id)
+            .unwrap()
+            .attrs()
+            .iter()
+            .any(|e| e.key == base::StorageAttrKey::Axis as u8);
+        assert!(has_axis, "Fused 节点应保留 reduce 的 axis attr");
+
+        // 全链路：lowering 发 "fused" kernel，isel 选 "fused" 指令（不崩）
+        let arch_graph = arch::lower(&graph, Target::Cuda).unwrap();
+        let instrs = isel::select(&arch_graph).unwrap();
+        assert!(
+            instrs.iter().any(|i| i.op == "fused"),
+            "isel 应为 Fused 选出 'fused' 指令"
+        );
+    }
 }
