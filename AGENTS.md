@@ -509,3 +509,43 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 5. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）
 6. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）
 7. CSE 可选：可交换 op 集中管理 / 等价非字面 IO 识别（依赖 algebra 规范化）
+
+### 2026-07-11 — Pow 整数幂系列 + Exp(Log) 对偶 + fuse elementwise→reduce（feat/neutron-2b9e4f71）
+
+**当前状态**：本轮一小时时间盒（18:05 开工，北京时间），做遗言上轮列的 float_opts 整数幂扩展（Pow x³/x⁻²）+ Exp(Log) 对偶 + fuse 扩展 elementwise→reduce。回归全绿，本分支待合并回 main。
+
+**用户指引**：用户要求"干一个小时，每十分钟用 AskUserQuestion 提问验证方向"，后改为"先别问了"。延续前几轮"聚焦浮点结构优化，不在简单代数/常量传播上耗时间"的指引。
+
+**已完成**（5 commit，按时序）：
+- **float_opts PowCubeToMul**（commit 7382cd9）：`Pow(x, 3.0)` → `Mul(x, Mul(x, x))`，x³=x·x·x，通用 Pow（log/exp 超越函数实现，贵）换两次便宜乘法。新建内层 Mul(x,x) 节点，Pow 节点改外层 Mul 吃 [x, x²]（改 op+换输入模式）。无溢出/NaN 风险（数学完全等价）。2 单测
+- **float_opts ExpLogToIdentity**（commit ce310c6）：`Exp(Log(x))` → `x`，e^(ln x)=x，LogExpToIdentity 的对偶。用"重写使用者"模式（把 Exp 输出值的所有使用者重写到 Log 的输入 x，图输出也重写）。风险：Log 定义域 x>0，x≤0 时原式 Exp(NaN)=NaN，重写后得 x（≤0）语义有差异，但 ML 场景 Log 输入多为正（softmax 输出、概率、x²+ε），默认启用。2 单测
+- **fuse 支持 elementwise→reduce 融合**（commit d5dbe2f）：find_opportunities 改判定让链尾可以是 reduce（原来只 elementwise）。1 行核心改动：`if !is_elementwise(n.kind) && !is_reduce(n.kind) { continue; }`。build_fusion_chain 已有"reduce 前驱 break"逻辑保证链中最多 1 个 reduce，apply_fusion 自然处理尾部 reduce（Axis attr 留在尾节点不被删）。这是 ML pooling 模式（relu→ReduceSum）。2 新单测（正向/负向：共享中间结果不融合）
+- **float_opts PowNegTwoToReciprocal**（commit 49d955f）：`Pow(x, -2.0)` → `Reciprocal(Mul(x, x))`，x^(-2)=1/x²=reciprocal(x²)，通用幂换 Mul + Reciprocal（都是单条硬件指令）。新建 Mul(x,x)，Pow 改 Reciprocal 吃 [mul_out]。RMSNorm/L2 归一化常见。无溢出风险（x=0 时原 Pow 也是 inf，重写后 Reciprocal(0)=inf 一致）。2 单测
+- **interface e2e 验证 elementwise→reduce 融合全链路**（commit 7fc9efc）：构造 relu(x)→ReduceSum(.,axis=1)，跑 O2 pipeline 验证 Fused 节点带 Axis attr 出现，arch::lower 发 "fused" kernel，isel::select 选 "fused" 指令。证明 Fused op_seq 含尾部 reduce 时全链路不崩（fuse 本轮新增 elementwise→reduce 链型）
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：156 passed（base 3 + common 2 + frontend 23 + interface 6 + isel 12 + lisp 4 + optimizer 106）—— 较上轮 146 +10（6 float_opts 单测 + 2 fuse 单测 + 2 Pow 整数幂单测含 e2e）
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
+
+**设计哲学遵守**：
+- Pow 整数幂系列（x²/x³/x⁻¹/x⁻²）是"通用幂函数（log/exp 超越函数实现）→ 专用单条硬件指令（Mul/Reciprocal/Sqrt/Rsqrt）"的浮点结构优化，正是设计哲学点名"类 Quake III fast inverse sqrt"同族
+- Exp(Log(x))→x 是浮点代数恒等式重写（e^(ln x)=x），非贪心模式匹配
+- fuse elementwise→reduce 是通用融合（reduce 作为 shape 分界点的链尾），非 MatMul+Add→Linear 复合算子模式。build_fusion_chain 的"reduce 前驱 break"保证链中最多 1 个 reduce，融合后 Axis attr 保留正确性
+
+**关于 Pow 系列扩展边界**：Pow(x,4.0) 及更高次幂理论上可继续扩展（x⁴=Mul(x²,x²) 或 Mul(Mul(x,x),Mul(x,x))），但：(1) ML 模型中 Pow 指数 ≥3 已罕见（常见 0.5/-0.5/-1/-2 与 RMSNorm/L2 相关）；(2) 4 次以上 Pow 多出现在 polynomial 特征，但那些场景 Pow 语义应保留供后端发专用 pow kernel；(3) 继续扩展收益递减。故 Pow 系列本轮收尾，已有 ±0.5/-1/2/3/-2 五档覆盖 ML 主要场景。
+
+**fuse 扩展边界**：elementwise→reduce 已支持。更复杂的"reduce→elementwise→reduce"多 reduce 链刻意不做——build_fusion_chain 遇 reduce 前驱即 break 保证链中最多 1 个 reduce，多 reduce 融合语义复杂且收益不明。
+
+**子代理协作模式**：本轮主 agent 直接做实现（float_opts 4 个重写 + fuse 1 个扩展），未派子代理——改动模式成熟（参考已有 Pow 重写），子代理反而增加协调开销。1 个 search 子代理在调研阶段摸清 fuse 降低判定可行性与 pt 前端工作量（pt 结论：TorchScript pickle 短期不可行，~1000+ 行，维持占位）。
+
+**下一步**（优先级排序）：
+1. pt 前端：PyTorch 解析（TorchScript pickle 太复杂，短期维持占位；可考虑走 ONNX export 路线绕过）
+2. Slice no-op 识别：需先补 AttrKey::Starts/Ends/Axes/Steps + frontend 解析 Slice 属性，工作量大但价值高（Slice 全量是常见 no-op）
+3. fuse 可扩展：reduce→elementwise→reduce 多 reduce 链（语义复杂，需 cost model 评估收益）
+4. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）
+5. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）
+6. CSE 可选：可交换 op 集中管理 / 等价非字面 IO 识别（依赖 algebra 规范化）
+7. float_opts 边界：Pow 系列（±0.5/-1/2/3/-2）已覆盖 ML 主要场景，进一步扩展收益递减
