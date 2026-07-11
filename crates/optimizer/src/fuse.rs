@@ -41,7 +41,9 @@ pub fn find_opportunities(graph: &Graph, coeffs: CostCoeffs) -> Result<Vec<Fusio
     let mut opps = Vec::new();
     for id in graph.node_ids() {
         let n = graph.node(id)?;
-        if !is_elementwise(n.kind) {
+        // 链尾可以是 elementwise 或 reduce：elementwise→reduce 是 ML 常见模式
+        // （如 relu 后接 ReduceSum/ReduceMean pooling），reduce 作为链尾融合
+        if !is_elementwise(n.kind) && !is_reduce(n.kind) {
             continue;
         }
         if let Some((chain, side_inputs, side_positions)) = build_fusion_chain(graph, id)? {
@@ -87,7 +89,10 @@ fn is_elementwise(kind: OpKind) -> bool {
     )
 }
 
-/// reduce 类算子（改变 shape，只能在融合链最前面，作为链头）
+/// reduce 类算子（改变 shape）。reduce 可出现在融合链的 head 或 tail：
+/// head = reduce→elementwise（已有，reduce 后接 elementwise 链）；
+/// tail = elementwise→reduce（本轮新增，如 relu→ReduceSum pooling）。
+/// 链中最多 1 个 reduce（build_fusion_chain 遇 reduce 前驱即 break 保证）
 fn is_reduce(kind: OpKind) -> bool {
     matches!(
         kind,
@@ -101,7 +106,10 @@ type ChainResult = Option<(Vec<base::NodeId>, Vec<ValueId>, Vec<i64>)>;
 
 /// 从 start 往前建链：找 start 的 elementwise/reduce 前驱，递归。
 ///
-/// 链头允许一个 reduce（reduce→elementwise 融合，含 binary elementwise）。
+/// reduce 可出现在链的 head 或 tail（链中最多 1 个 reduce）：
+/// start 是 elementwise(tail) 时向前扩，前驱是 reduce 则 break 作 head（reduce→elementwise）；
+/// start 是 reduce(tail) 时向前扩 elementwise 前驱，再前驱若又是 reduce 则 break
+///（elementwise→reduce 融合，如 relu→ReduceSum）。
 /// reduce 后不再往前扩展（reduce 是 shape 分界点）。
 ///
 /// binary elementwise 的"非链前驱"输入作为 side input 收集。若某 side input
@@ -787,5 +795,123 @@ mod tests {
             "最长链应为 MAX_FUSION_CHAIN={}，实际 {}",
             MAX_FUSION_CHAIN, max_len
         );
+    }
+
+    /// `relu(x) -> ReduceSum(., axis=1)`：elementwise→reduce 融合（reduce 作为链尾）。
+    /// ML 常见模式（激活后 pooling/求和）。本轮新增：放开 reduce 作为建链起点
+    #[test]
+    fn elementwise_then_reduce_fuses() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4, 8],
+            },
+            Some("x"),
+        );
+        g.mark_input(x);
+        let relu = g.add_node(OpKind::Relu);
+        let r_out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4, 8],
+            },
+            Some("r"),
+            relu,
+        );
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[r_out]);
+        let rs = g.add_node(OpKind::ReduceSum);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
+            Some("o"),
+            rs,
+        );
+        g.storage.set_node_inputs(rs, &[r_out]);
+        g.storage.set_node_outputs(rs, &[out]);
+        g.storage.add_attr_int(rs, base::StorageAttrKey::Axis, 1);
+        g.mark_output(out);
+
+        let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
+        assert_eq!(count, 1);
+        // 融合后应只剩 1 个 Fused 节点（原 ReduceSum 尾节点改 Fused，relu 被 compact 删）
+        let customs: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Fused)
+            .collect();
+        assert_eq!(customs.len(), 1);
+        // Fused 节点应保留 reduce 的 axis attr（tail 是 reduce，Axis 原本就在 tail 上）
+        let custom = customs[0];
+        let has_axis = g
+            .node(custom)
+            .unwrap()
+            .attrs()
+            .iter()
+            .any(|e| e.key == base::StorageAttrKey::Axis as u8);
+        assert!(has_axis, "融合节点应保留 reduce 的 axis attr");
+        // relu 节点应已被 compact 删除
+        let relus: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Relu)
+            .collect();
+        assert!(relus.is_empty(), "relu 节点应被融合删除");
+    }
+
+    /// `relu(x) -> ReduceSum(., axis=1)`，但 reduce 输出被另一节点共享：
+    /// 不应融合（reduce 输出非独占使用）
+    #[test]
+    fn elementwise_then_reduce_not_fused_when_shared() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4, 8],
+            },
+            Some("x"),
+        );
+        g.mark_input(x);
+        let relu = g.add_node(OpKind::Relu);
+        let r_out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4, 8],
+            },
+            Some("r"),
+            relu,
+        );
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[r_out]);
+        let rs = g.add_node(OpKind::ReduceSum);
+        let rs_out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
+            Some("rs"),
+            rs,
+        );
+        g.storage.set_node_inputs(rs, &[r_out]);
+        g.storage.set_node_outputs(rs, &[rs_out]);
+        g.storage.add_attr_int(rs, base::StorageAttrKey::Axis, 1);
+        // 另一个节点也用 r_out（relu 输出被共享）→ 不应融合
+        let sig = g.add_node(OpKind::Sigmoid);
+        let sig_out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4, 8],
+            },
+            Some("s"),
+            sig,
+        );
+        g.storage.set_node_inputs(sig, &[r_out]);
+        g.storage.set_node_outputs(sig, &[sig_out]);
+        g.mark_output(rs_out);
+        g.mark_output(sig_out);
+
+        let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
+        assert_eq!(count, 0, "relu 输出被共享时不应融合");
     }
 }
