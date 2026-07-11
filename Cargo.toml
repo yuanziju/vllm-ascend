@@ -9,6 +9,7 @@ members = [
     "crates/lisp",
     "crates/isel",
     "crates/regalloc",
+    "crates/backend",
     "crates/interface",
     "crates/cli",
 ]
@@ -29,6 +30,7 @@ arch = { path = "crates/arch" }
 lisp = { path = "crates/lisp" }
 isel = { path = "crates/isel" }
 regalloc = { path = "crates/regalloc" }
+backend = { path = "crates/backend" }
 interface = { path = "crates/interface" }
 thiserror = "1"
 tracing = "0.1"

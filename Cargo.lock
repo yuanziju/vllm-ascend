@@ -11,6 +11,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "backend"
+version = "0.1.0"
+dependencies = [
+ "base",
+ "common",
+ "regalloc",
+ "thiserror",
+]
+
+[[package]]
 name = "base"
 version = "0.1.0"
 dependencies = [
