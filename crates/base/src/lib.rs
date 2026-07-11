@@ -181,6 +181,10 @@ pub enum OpKind {
     /// Reciprocal：1/x 单 op。ONNX Reciprocal 算子映射而来。float_opts 把
     /// `Reciprocal(Sqrt(x))` 融合成 `Rsqrt(x)`（1/√x = x^(-1/2)，同 FastInvSqrt 恒等式）
     Reciprocal = 28,
+    /// Abs：|x|，单条硬件指令。float_opts 的 Sqrt(x*x)→Abs(x) 重写需要（√(x²)=|x|）
+    Abs = 29,
+    /// Log：自然对数 ln(x)，超越函数。float_opts 的 Log(Exp(x))→x 重写需要（ln(eˣ)=x）
+    Log = 30,
     /// Fused：多对一融合结果（fuse pass 把 elementwise 链合成单节点）。attr 记 op 序列
     /// (Shape,IntArray) + side input 位置 (Strides,IntArray) + 可选 reduce 轴 (Axis,Int)，
     /// 供 lowering 重建子图。**与 Custom 区分**：Custom 留给未知 ONNX 算子（attr 记原始
@@ -221,6 +225,8 @@ impl OpKind {
             26 => Ok(Self::Rsqrt),
             27 => Ok(Self::Fused),
             28 => Ok(Self::Reciprocal),
+            29 => Ok(Self::Abs),
+            30 => Ok(Self::Log),
             64 => Ok(Self::Custom),
             _ => Err(NeutronError::Ir(format!("未知 op tag: {}", v))),
         }

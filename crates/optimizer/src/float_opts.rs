@@ -24,6 +24,12 @@
 //!   RMSNorm 的 `x * Pow(var+eps, -0.5)` 常见此模式
 //! - **PowNegOneToReciprocal**：`Pow(x, -1.0)` → `Reciprocal(x)`。x^(-1)=1/x，
 //!   同 PowHalfToSqrt 一类：通用幂 → 专用 op（单条硬件指令）
+//! - **PowSquareToMul**：`Pow(x, 2.0)` → `Mul(x, x)`。x²=x·x，通用幂（用 log/exp
+//!   实现的超越函数，贵）换成便宜乘法。无溢出/NaN 风险（数学完全等价）
+//! - **SqrtSquareToAbs**：`Sqrt(x*x)` → `Abs(x)`。√(x²)=|x|，Sqrt+Mul 换单条
+//!   Abs 硬件指令。两输入相同（x*x）才匹配，x*y 无简化。L2 norm 的 sqrt(x·x) 常见
+//! - **LogExpToIdentity**：`Log(Exp(x))` → `x`。ln(eˣ)=x，消去 Log+Exp 两个 op。
+//!   代数恒等式重写，ML 场景 x 极少大到 Exp 溢出（f32 阈值约 x>889），默认启用
 //! - **DivByConstToMul**：`x / c` → `x * (1/c)`。除法 latency 远高于乘法，
 //!   预计算倒数转成乘法。注意：对 c=0 不做；浮点倒数有精度损失但可接受。
 //! - **MulByTwoToAdd**：`x * 2.0` → `x + x`。乘以 2 的幂可用 IEEE754 位级
@@ -102,6 +108,25 @@ pub enum FloatOpt {
         pow_node: base::NodeId,
         base: ValueId,
     },
+    /// `Sqrt(x*x)` → `Abs(x)`：√(x²)=|x|，Sqrt+Mul 换单条 Abs 硬件指令。
+    /// 注意：只匹配两输入相同（x*x），不是 x*y（x≠y 时 √(xy) 无简化）
+    SqrtSquareToAbs {
+        sqrt_node: base::NodeId, // 主操作节点，改 Abs
+        x_input: ValueId,        // Mul 的输入（两输入相同，取一个）
+    },
+    /// `Log(Exp(x))` → `x`：ln(eˣ)=x，消去 Log+Exp。log_node 仅记录（孤儿交 DCE）。
+    /// 溢出边界：数学上 ln(eˣ)=x 对所有有限 x 成立。运行时 Exp(x) 溢出成 inf 时
+    /// Log(inf)=inf，重写后直接得 x（有限值）——语义有差异。但这是代数恒等式重写，
+    /// 且 ML 场景 x 极少大到 Exp 溢出（f32 阈值约 x>889）。默认启用。
+    LogExpToIdentity {
+        log_node: base::NodeId, // 仅记录，不改 op（输出被重写走，孤儿交 DCE）
+        x_input: ValueId,       // Exp 的输入，重写目标
+    },
+    /// `Pow(x, 2.0)` → `Mul(x, x)`：x²=x·x，通用幂换便宜乘法（Pow 用 log/exp 实现，贵）
+    PowSquareToMul {
+        pow_node: base::NodeId, // 主操作节点，改 Mul
+        base: ValueId,          // 底数 x，两个输入都用它
+    },
 }
 
 pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
@@ -141,6 +166,19 @@ pub fn find_opportunities(graph: &Graph) -> Result<Vec<FloatOpt>> {
             }
             OpKind::Pow => {
                 if let Some(opt) = try_match_pow_half(graph, n)? {
+                    opts.push(opt);
+                }
+                if let Some(opt) = try_match_pow_square(graph, n)? {
+                    opts.push(opt);
+                }
+            }
+            OpKind::Sqrt => {
+                if let Some(opt) = try_match_sqrt_square(graph, n)? {
+                    opts.push(opt);
+                }
+            }
+            OpKind::Log => {
+                if let Some(opt) = try_match_log_exp(graph, n)? {
                     opts.push(opt);
                 }
             }
@@ -376,6 +414,75 @@ fn try_match_pow_half(graph: &Graph, pow: NodeView) -> Result<Option<FloatOpt>> 
     }
 }
 
+/// 识别 `Sqrt(x*x)`：Sqrt 节点，输入(ins[0]) 是 Mul 节点输出，且 Mul 两输入相同。
+/// √(x²)=|x|，Sqrt+Mul 换单条 Abs 硬件指令。注意：只匹配 x*x（两输入相同），
+/// x*y（x≠y）时 √(xy) 无简化。底数符号不影响（x² 始终非负，√(x²)=|x| 对所有 x 成立）
+fn try_match_sqrt_square(graph: &Graph, sqrt: NodeView) -> Result<Option<FloatOpt>> {
+    let Some(&y) = sqrt.inputs().first() else {
+        return Ok(None);
+    };
+    let y_def = graph.value(y)?.def_node();
+    if y_def == u32::MAX {
+        return Ok(None);
+    }
+    let mul_node = graph.node(y_def)?;
+    if mul_node.kind != OpKind::Mul {
+        return Ok(None);
+    }
+    let ins = mul_node.inputs();
+    if ins.len() != 2 {
+        return Ok(None);
+    }
+    // 两输入必须是同一个 value（x*x），不是 x*y
+    if ins[0] != ins[1] {
+        return Ok(None);
+    }
+    Ok(Some(FloatOpt::SqrtSquareToAbs {
+        sqrt_node: sqrt.id,
+        x_input: ins[0],
+    }))
+}
+
+/// 识别 `Log(Exp(x))`：Log 节点，输入(ins[0]) 是 Exp 节点输出。
+/// ln(eˣ)=x，消去 Log+Exp。Log 节点输出被重写到 x，节点本身不改 op（孤儿交 DCE）
+fn try_match_log_exp(graph: &Graph, log: NodeView) -> Result<Option<FloatOpt>> {
+    let Some(&y) = log.inputs().first() else {
+        return Ok(None);
+    };
+    let y_def = graph.value(y)?.def_node();
+    if y_def == u32::MAX {
+        return Ok(None);
+    }
+    let exp_node = graph.node(y_def)?;
+    if exp_node.kind != OpKind::Exp {
+        return Ok(None);
+    }
+    let Some(&x_input) = exp_node.inputs().first() else {
+        return Ok(None);
+    };
+    Ok(Some(FloatOpt::LogExpToIdentity {
+        log_node: log.id,
+        x_input,
+    }))
+}
+
+/// 识别 `Pow(x, 2.0)`：Pow 节点，指数输入(ins[1])是常量 2.0。
+/// x²=x·x，把通用 Pow（log/exp 实现的超越函数，贵）换成便宜 Mul。无溢出/NaN 风险
+fn try_match_pow_square(graph: &Graph, pow: NodeView) -> Result<Option<FloatOpt>> {
+    let ins = pow.inputs();
+    if ins.len() != 2 {
+        return Ok(None);
+    }
+    let (base, exp) = (ins[0], ins[1]);
+    if constant_value(graph, exp)? == Some(2.0) {
+        return Ok(Some(FloatOpt::PowSquareToMul {
+            pow_node: pow.id,
+            base,
+        }));
+    }
+    Ok(None)
+}
+
 fn constant_value(graph: &Graph, v: ValueId) -> Result<Option<f64>> {
     let val = graph.value(v)?;
     let def = val.def_node();
@@ -582,6 +689,52 @@ pub fn apply_float_opts(graph: &mut Graph) -> Result<usize> {
                 // 输入换成 [x]（丢弃常量指数）。x^(-1)=1/x=reciprocal(x)
                 graph.storage.set_node_inputs(pow_node, &[base]);
                 graph.storage.node_hdr[pow_node as usize].op_tag = OpKind::Reciprocal as u8;
+                applied += 1;
+            }
+            FloatOpt::SqrtSquareToAbs { sqrt_node, x_input } => {
+                // Sqrt(x*x) → Abs(x)：√(x²)=|x|。把 Sqrt 节点 op 改成 Abs，
+                // 输入换成 [x]（丢弃 Mul 的另一份相同输入）。输出 value 不变（使用者无感），
+                // 原 Mul(x,x) 节点变孤儿交给 DCE
+                graph.storage.set_node_inputs(sqrt_node, &[x_input]);
+                graph.storage.node_hdr[sqrt_node as usize].op_tag = OpKind::Abs as u8;
+                applied += 1;
+            }
+            FloatOpt::LogExpToIdentity { log_node, x_input } => {
+                // Log(Exp(x)) → x：ln(eˣ)=x。把 Log 输出值的所有使用者重写为 x_input
+                // （Exp 的输入）。Log 节点本身不改 op，输出无人用后变孤儿交给 DCE
+                let log_outs: Vec<ValueId> = graph.node(log_node)?.outputs().to_vec();
+                if let Some(&log_out) = log_outs.first() {
+                    if log_out != x_input {
+                        // 避免自引用死循环：log_out != x_input 才重写
+                        let node_ids: Vec<u32> = graph.node_ids().collect();
+                        for nid in node_ids {
+                            let old_inputs: Vec<ValueId> = graph.node(nid)?.inputs().to_vec();
+                            if old_inputs.contains(&log_out) {
+                                let new_inputs: Vec<ValueId> = old_inputs
+                                    .iter()
+                                    .map(|&v| if v == log_out { x_input } else { v })
+                                    .collect();
+                                graph.storage.set_node_inputs(nid, &new_inputs);
+                            }
+                        }
+                        // 图输出也要重写
+                        let old_outputs: Vec<ValueId> = graph.outputs().to_vec();
+                        if old_outputs.contains(&log_out) {
+                            let new_outputs: Vec<ValueId> = old_outputs
+                                .iter()
+                                .map(|&v| if v == log_out { x_input } else { v })
+                                .collect();
+                            graph.storage.outputs = new_outputs;
+                        }
+                    }
+                }
+                applied += 1;
+            }
+            FloatOpt::PowSquareToMul { pow_node, base } => {
+                // Pow(x, 2.0) → Mul(x, x)：Pow 节点改 Mul，输入换 [x, x]（两输入都是 base），
+                // 丢弃常量指数 2.0。输出 value 不变（使用者无感），原常量 2.0 节点变孤儿交 DCE
+                graph.storage.set_node_inputs(pow_node, &[base, base]);
+                graph.storage.node_hdr[pow_node as usize].op_tag = OpKind::Mul as u8;
                 applied += 1;
             }
         }
@@ -1132,5 +1285,176 @@ mod tests {
         assert_eq!(n.kind, OpKind::Reciprocal, "Pow(x,-1) 应改成 Reciprocal");
         assert_eq!(n.inputs(), &[x], "Reciprocal 输入应为 [x]");
         assert_eq!(n.outputs(), &[out]);
+    }
+
+    /// `Sqrt(x*x)` → `Abs(x)`：√(x²)=|x|，Sqrt 节点本身改 Abs，输入换成 [x]
+    #[test]
+    fn sqrt_square_to_abs() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let mul = g.add_node(OpKind::Mul);
+        let mul_out = g.add_value(Type::Scalar(DType::F32), Some("m"), mul);
+        g.storage.set_node_inputs(mul, &[x, x]); // x*x
+        g.storage.set_node_outputs(mul, &[mul_out]);
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[mul_out]);
+        g.storage.set_node_outputs(sqrt, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // Sqrt 节点应已变成 Abs，输入换成 [x]
+        let n = g.node(sqrt).unwrap();
+        assert_eq!(n.kind, OpKind::Abs, "Sqrt(x*x) 应改成 Abs");
+        assert_eq!(n.inputs(), &[x], "Abs 输入应为 [x]");
+        assert_eq!(n.outputs(), &[out]);
+    }
+
+    /// `Sqrt(x*y)`（x≠y）不应触发 SqrtSquareToAbs（两输入不同，√(xy) 无简化）
+    #[test]
+    fn sqrt_xy_not_matched() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let y = g.add_input(Type::Scalar(DType::F32), Some("y"));
+        let mul = g.add_node(OpKind::Mul);
+        let mul_out = g.add_value(Type::Scalar(DType::F32), Some("m"), mul);
+        g.storage.set_node_inputs(mul, &[x, y]); // x*y（x≠y）
+        g.storage.set_node_outputs(mul, &[mul_out]);
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[mul_out]);
+        g.storage.set_node_outputs(sqrt, &[out]);
+        g.mark_output(out);
+
+        let opts = find_opportunities(&g).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, FloatOpt::SqrtSquareToAbs { .. })),
+            "Sqrt(x*y)（x≠y）不应触发 SqrtSquareToAbs"
+        );
+    }
+
+    /// `Sqrt(x*x)` 张量模式：改 Abs 后输出 value shape 不变
+    #[test]
+    fn sqrt_square_tensor_preserves_shape() {
+        let mut g = Graph::new("test");
+        let ty = Type::Tensor {
+            dtype: DType::F32,
+            dims: vec![2, 3],
+        };
+        let x = g.add_input(ty.clone(), Some("x"));
+        let mul = g.add_node(OpKind::Mul);
+        let mul_out = g.add_value(ty.clone(), Some("m"), mul);
+        g.storage.set_node_inputs(mul, &[x, x]);
+        g.storage.set_node_outputs(mul, &[mul_out]);
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let out = g.add_value(ty.clone(), Some("out"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[mul_out]);
+        g.storage.set_node_outputs(sqrt, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let n = g.node(sqrt).unwrap();
+        assert_eq!(n.kind, OpKind::Abs);
+        assert_eq!(n.inputs(), &[x]);
+        // 输出 value 仍是 out，shape 不变
+        assert_eq!(n.outputs(), &[out]);
+        let out_val = g.value(out).unwrap();
+        assert_eq!(out_val.shape(), &[2, 3], "输出 shape 应保持 [2,3]");
+    }
+
+    /// `Log(Exp(x))` → `x`：ln(eˣ)=x，图输出重写到 x_input，Exp 输入仍是 x
+    #[test]
+    fn log_exp_to_identity() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let exp = g.add_node(OpKind::Exp);
+        let exp_out = g.add_value(Type::Scalar(DType::F32), Some("ex"), exp);
+        g.storage.set_node_inputs(exp, &[x]);
+        g.storage.set_node_outputs(exp, &[exp_out]);
+        let log = g.add_node(OpKind::Log);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), log);
+        g.storage.set_node_inputs(log, &[exp_out]);
+        g.storage.set_node_outputs(log, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        // 图输出应重写到 x（不再是 log 的输出 out）
+        assert!(
+            g.outputs().contains(&x),
+            "图输出应重写到 x_input（Exp 的输入）"
+        );
+        assert!(!g.outputs().contains(&out), "log 的输出 out 不应再是图输出");
+        // Exp 节点输入仍是 x（apply 不改 Exp）
+        assert_eq!(g.node(exp).unwrap().inputs(), &[x], "Exp 节点输入应仍是 x");
+    }
+
+    /// `Log(Sqrt(x))`（输入非 Exp）不应触发 LogExpToIdentity
+    #[test]
+    fn log_non_exp_not_matched() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let sqrt_out = g.add_value(Type::Scalar(DType::F32), Some("sx"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[x]);
+        g.storage.set_node_outputs(sqrt, &[sqrt_out]);
+        let log = g.add_node(OpKind::Log);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), log);
+        g.storage.set_node_inputs(log, &[sqrt_out]);
+        g.storage.set_node_outputs(log, &[out]);
+        g.mark_output(out);
+
+        let opts = find_opportunities(&g).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, FloatOpt::LogExpToIdentity { .. })),
+            "Log(Sqrt(x)) 不应触发 LogExpToIdentity（输入非 Exp）"
+        );
+    }
+
+    /// `Pow(x, 2.0)` → `Mul(x, x)`：Pow 节点本身改 Mul，输入换成 [x, x]
+    #[test]
+    fn pow_square_to_mul() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, two) = g.add_constant_f64(2.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, two]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let count = apply_float_opts(&mut g).unwrap();
+        assert_eq!(count, 1);
+        let n = g.node(pow).unwrap();
+        assert_eq!(n.kind, OpKind::Mul, "Pow(x,2.0) 应改成 Mul");
+        assert_eq!(n.inputs(), &[x, x], "Mul 输入应为 [x, x]");
+        assert_eq!(n.outputs(), &[out]);
+    }
+
+    /// `Pow(x, 3.0)`（指数非 2.0）不应触发 PowSquareToMul
+    #[test]
+    fn pow_non_two_not_matched() {
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let (_c, three) = g.add_constant_f64(3.0);
+        let pow = g.add_node(OpKind::Pow);
+        let out = g.add_value(Type::Scalar(DType::F32), Some("out"), pow);
+        g.storage.set_node_inputs(pow, &[x, three]);
+        g.storage.set_node_outputs(pow, &[out]);
+        g.mark_output(out);
+
+        let opts = find_opportunities(&g).unwrap();
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, FloatOpt::PowSquareToMul { .. })),
+            "Pow(x,3.0) 不应触发 PowSquareToMul"
+        );
     }
 }

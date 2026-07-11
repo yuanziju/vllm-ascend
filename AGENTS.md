@@ -395,3 +395,38 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 3. fuse 可扩展：reduce + elementwise 更复杂模式（当前 binary side inputs + reduce 链头已支持）
 4. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）
 5. isel：规则从文件热加载已有，可考虑按 target 分规则集（CUDA/NPU/CPU 不同指令）
+
+### 2026-07-11 — Abs+Log op 全链路 + 3 个浮点结构重写（feat/neutron-ab5e1007）
+
+**当前状态**：完成遗言上轮列的 float_opts 两项（Sqrt(x*x)→Abs、Log(Exp(x))→x）+ 扩展一个 Pow(x,2)→Mul。新增 Abs(29)+Log(30) 两个 op 全链路接入。回归全绿，本分支待合并回 main。
+
+**用户指引延续**：聚焦浮点结构优化（项目招牌），不在简单代数/常量传播上耗时间。本轮全部用子代理实现（主 agent 只做 git 提交+验证，避免上下文崩）。用户要求短时间盒+多子代理。
+
+**已完成**（3 commit，按时序）：
+- **base 新增 Abs(29)+Log(30) op 全链路接入**（commit b8f8eb2）：为 Sqrt(x*x)→Abs 和 Log(Exp(x))→x 铺前置依赖。8 处全链路：base OpKind enum+from_u8 / shape_infer（unary elementwise passthrough）/ cost_model（Abs 同 Relu、Log 同 Sigmoid/Tanh 量级）/ lowering（abs/log kernel，match 无 catch-all 穷举检查强制覆盖）/ isel（abs/log lisp 规则）/ frontend onnx+dsl 映射 / fuse is_elementwise 融合候选。Abs 是单条硬件指令（√(x²)=|x|），Log 是超越函数（ln(eˣ)=x）
+- **float_opts Sqrt(x*x)→Abs + Log(Exp(x))→x**（commit c071ffe）：
+  - `Sqrt(x*x)→Abs(x)`：√(x²)=|x|，Sqrt+Mul 两 op 换单条 Abs 硬件指令。try_match_sqrt_square 匹配 Sqrt 输入是 Mul 且两输入相同（x*x，x≠y 不匹配）；apply 用"改 op+换输入"模式（参考 PowHalfToSqrt），Sqrt 改 Abs 输入换 [x]，原 Mul 变孤儿交 DCE。3 单测（正向/负向/张量 shape）
+  - `Log(Exp(x))→x`：ln(eˣ)=x，消去 Log+Exp 两 op。try_match_log_exp 匹配 Log 输入是 Exp；apply 用"重写使用者"模式（参考 ExpMulFusion 但不新建节点），把 Log 输出值的所有使用者重写到 Exp 的输入 x，图输出也重写，带 log_out!=x_input 守卫防自引用。溢出边界：数学上对所有有限 x 成立，运行时 Exp 溢出成 inf 时语义有差异（inf→有限值），但 ML 场景 x 极少大到 Exp 溢出（f32 阈值约 x>889），默认启用。2 单测（正向/负向）
+- **float_opts Pow(x,2.0)→Mul(x,x)**（commit 2639d42）：x²=x·x，通用 Pow（log/exp 超越函数实现，贵）换便宜 Mul。Pow 节点改 Mul，输入换 [x,x]（两输入都是 base），丢弃常量指数 2.0，输出 value 不变（使用者无感），原常量节点变孤儿交 DCE。无溢出/NaN 风险（数学完全等价）。用"改 op+换输入"模式。2 单测（正向/负向）
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：132 passed（base 3 + common 2 + frontend 23 + interface 5 + isel 12 + lisp 4 + optimizer 83）—— 较上轮 125 +7（5 Sqrt/Log 单测 + 2 Pow 单测）
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常（空 onnx 走 Placeholder，pipeline 串联成功）
+
+**设计哲学遵守**：3 个新重写全是浮点代数恒等式：√(x²)=|x|、ln(eˣ)=x、x²=x·x。是设计哲学点名"IEEE754 位级 trick / 浮点结构重排"的具体落地，非 MatMul+Add→Linear 贪心模式。严格遵守两阶段模式（find_opportunities 借图只读收集，apply_float_opts 独占可变借用改图）。
+
+**关于 RMSNorm 整体 cost-based 识别（遗言上轮列的 float_opts 第1项，本轮未做）**：评估后认为识别 x*rsqrt(y) 的 RMSNorm 整体模式本质是复合算子模式识别（需识别 var=ReduceMean(x*x) 整个结构），触及设计哲学"不要贪心模式匹配"红线。且 x*rsqrt(y) 若都是 elementwise，fuse 的 elementwise 链融合已能处理。故推迟，不在 float_opts 做整体 RMSNorm 识别。
+
+**isel 覆盖现状**：lowering 现显式覆盖全部 OpKind 变体（31 个，除 Custom=64 保留段），无 catch-all。新增 Abs/Log 已四点全接。新增 op 时编译器穷举检查强制补 lowering 分支。
+
+**子代理协作模式**：本轮 3 个实现任务全派 general_purpose_task 子代理（1 个做 op 全链路接入、1 个做 Sqrt/Log 重写、1 个做 Pow 重写），主 agent 只做 Read 调研+git 提交+回归验证。2 个 search 子代理先并行摸清 float_opts 结构和 op 接入点，给实现子代理精确行号+代码模式。主 agent 上下文未爆。
+
+**下一步**（优先级排序）：
+1. pt 前端：PyTorch 解析（frontend 最后一块占位）
+2. float_opts 可继续：`Exp(Log(x))→x`（LogExpToIdentity 对偶，e^(ln x)=x，但 x>0 定义域约束风险更高，ML 罕见）；`Pow(x,3.0)→Mul(x,Mul(x,x))`（整数幂换乘法扩展，需新建嵌套 Mul）；`Sqrt(Sqrt(x))` 不做（Pow(x,0.25) 比 Sqrt 更贵，负优化）
+3. fuse 可扩展：reduce + elementwise 更复杂模式（当前 binary side inputs + reduce 链头已支持）
+4. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）
+5. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）

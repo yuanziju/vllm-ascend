@@ -71,6 +71,10 @@ pub fn estimate_op(graph: &Graph, node: NodeView) -> Result<OpCost> {
     let (flops, launch) = match node.kind {
         OpKind::Add | OpKind::Sub | OpKind::Mul | OpKind::Div => (out_bytes / 4.0, 1.0),
         OpKind::Relu => (out_bytes / 4.0, 1.0),
+        // Abs：单条硬件指令，同 Relu 量级
+        OpKind::Abs => (out_bytes / 4.0, 1.0),
+        // Log：超越函数，比 sqrt 贵，参考 Sigmoid/Tanh 量级
+        OpKind::Log => (out_bytes / 4.0 * 4.0, 1.0),
         OpKind::Gelu => (out_bytes / 4.0 * 8.0, 1.0),
         OpKind::Sigmoid => (out_bytes / 4.0 * 4.0, 1.0),
         OpKind::Tanh => (out_bytes / 4.0 * 6.0, 1.0),
