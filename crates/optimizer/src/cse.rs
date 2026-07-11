@@ -19,6 +19,12 @@ pub struct CseResult {
     pub value_replacements: HashMap<ValueId, ValueId>,
 }
 
+/// 可交换二元操作：a·b = b·a，CSE 时排序 inputs 使交换前后的写法指纹相同。
+/// 未来新增可交换 op（如 Max/Min/Equal）在此集中维护，避免散落在指纹逻辑里
+fn is_commutative(kind: OpKind) -> bool {
+    matches!(kind, OpKind::Add | OpKind::Mul)
+}
+
 /// 子表达式指纹。CSE 据 IO 同样性识别公共子表达式。
 ///
 /// 指纹包含：
@@ -102,7 +108,7 @@ fn fingerprint(graph: &Graph, node_id: base::NodeId) -> Result<Option<Fingerprin
     }
     let mut ins = n.inputs().to_vec();
     // 可交换操作：排序 inputs 使 a+b 和 b+a 指纹相同
-    if matches!(n.kind, OpKind::Add | OpKind::Mul) {
+    if is_commutative(n.kind) {
         ins.sort_unstable();
     }
     let attr_hash = attr_fingerprint(n);
