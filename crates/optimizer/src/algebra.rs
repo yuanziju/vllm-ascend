@@ -43,6 +43,8 @@ pub fn simplify(graph: &Graph, node: NodeView, cfg: AlgebraConfig) -> Result<Sim
         OpKind::Pow => simplify_pow(graph, node),
         OpKind::Reshape => simplify_reshape(graph, node),
         OpKind::Transpose => simplify_transpose(graph, node),
+        OpKind::ReduceSum | OpKind::ReduceMean | OpKind::ReduceMax => simplify_reduce(graph, node),
+        OpKind::Concat => simplify_concat(graph, node),
         _ => Ok(SimplifyResult::NoChange),
     }
 }
@@ -227,6 +229,60 @@ fn simplify_transpose(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
     Ok(SimplifyResult::NoChange)
 }
 
+// --- 启发式 shape-based no-op 识别（reduce / concat） ---
+
+fn simplify_reduce(graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    // 启发式：Reduce(x, axis) 当 x 在 axis 维 size==1 时，reduce 是 no-op
+    // （沿 size-1 维 sum/mean/max = 该维唯一元素，值等于输入 squeeze 后的值）。
+    // 保守策略：额外校验 reduce 输出 shape 已知且等于输入去掉 axis 维后的 shape
+    // （即标准 reduce 语义下的正确结果 shape），保证 ReplaceWith 后 shape 严格正确。
+    let ins = node.inputs();
+    let Some(&input) = ins.first() else {
+        return Ok(SimplifyResult::NoChange);
+    };
+    let Some(axis) = read_axis(graph, node.id)? else {
+        return Ok(SimplifyResult::NoChange);
+    };
+    let in_shape = graph.value(input)?.shape();
+    if !shape_known(in_shape) {
+        return Ok(SimplifyResult::NoChange);
+    }
+    // axis 支持负值（shape_infer 的惯例）
+    let rank = in_shape.len() as i64;
+    let ax = if axis < 0 { axis + rank } else { axis };
+    if ax < 0 || ax >= rank {
+        return Ok(SimplifyResult::NoChange); // axis 越界，保守不处理
+    }
+    if in_shape[ax as usize] != 1 {
+        return Ok(SimplifyResult::NoChange); // axis 维 size!=1，非 no-op
+    }
+    // 标准 reduce 语义：消去 axis 维
+    let expected_out: Vec<i64> = in_shape
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i as i64 != ax)
+        .map(|(_, &d)| d)
+        .collect();
+    let outs = node.outputs();
+    let Some(&out_val) = outs.first() else {
+        return Ok(SimplifyResult::NoChange);
+    };
+    let out_shape = graph.value(out_val)?.shape();
+    if shape_known(out_shape) && out_shape == expected_out.as_slice() {
+        return Ok(SimplifyResult::ReplaceWith(input));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
+fn simplify_concat(_graph: &Graph, node: NodeView) -> Result<SimplifyResult> {
+    // 启发式：Concat 单输入 → 结果等于该输入（copy no-op）
+    let ins = node.inputs();
+    if ins.len() == 1 {
+        return Ok(SimplifyResult::ReplaceWith(ins[0]));
+    }
+    Ok(SimplifyResult::NoChange)
+}
+
 fn shape_known(s: &[i64]) -> bool {
     !s.is_empty() && s.iter().all(|&d| d > 0)
 }
@@ -238,6 +294,17 @@ fn read_perm(graph: &Graph, node: NodeId) -> Result<Option<Vec<i64>>> {
             && e.tag == base::storage::AttrTag::IntArray as u8
         {
             return Ok(Some(n.storage.attr_int_array(e).to_vec()));
+        }
+    }
+    Ok(None)
+}
+
+/// 读取节点 Axis 属性（Int），找不到返回 None
+fn read_axis(graph: &Graph, node: NodeId) -> Result<Option<i64>> {
+    let n = graph.node(node)?;
+    for e in n.attrs() {
+        if e.key == base::StorageAttrKey::Axis as u8 && e.tag == base::storage::AttrTag::Int as u8 {
+            return Ok(Some(n.storage.attr_int(e)));
         }
     }
     Ok(None)
@@ -830,5 +897,158 @@ mod tests {
         g.mark_output(out);
         let count = run_algebraic_simplify(&mut g).unwrap();
         assert_eq!(count, 0, "非均匀张量不应简化");
+    }
+
+    // --- 启发式 shape-based no-op 识别（reduce / concat）---
+
+    #[test]
+    fn reduce_size1_axis_to_input() {
+        // 输入 shape [2,1,3]，ReduceMean(x, axis=1)，axis=1 维 size==1
+        // 标准 reduce 语义输出 shape 应为 [2,3] → no-op，消除为 x
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 1, 3],
+            },
+            Some("x"),
+        );
+        let rs = g.add_node(OpKind::ReduceMean);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            rs,
+        );
+        g.storage.set_node_inputs(rs, &[x]);
+        g.storage.set_node_outputs(rs, &[out]);
+        g.storage.add_attr_int(rs, base::StorageAttrKey::Axis, 1);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1, "axis 维 size==1 的 reduce 应消除为 x");
+        assert_eq!(g.outputs(), &[x], "输出应重写为 x");
+    }
+
+    #[test]
+    fn reduce_non_size1_axis_not_simplified() {
+        // 输入 shape [2,3]，ReduceMean(x, axis=1)，axis=1 维 size=3≠1 → NoChange
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let rs = g.add_node(OpKind::ReduceMean);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2],
+            },
+            Some("out"),
+            rs,
+        );
+        g.storage.set_node_inputs(rs, &[x]);
+        g.storage.set_node_outputs(rs, &[out]);
+        g.storage.add_attr_int(rs, base::StorageAttrKey::Axis, 1);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0, "axis 维 size!=1 不应消除");
+    }
+
+    #[test]
+    fn reduce_size1_axis_wrong_out_shape_not_simplified() {
+        // 输入 shape [2,1,3]，axis=1 维 size==1，但输出 shape 故意设成 [2,1,3]
+        // （与 expected [2,3] 不符）→ 保守 NoChange
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 1, 3],
+            },
+            Some("x"),
+        );
+        let rs = g.add_node(OpKind::ReduceMean);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 1, 3],
+            },
+            Some("out"),
+            rs,
+        );
+        g.storage.set_node_inputs(rs, &[x]);
+        g.storage.set_node_outputs(rs, &[out]);
+        g.storage.add_attr_int(rs, base::StorageAttrKey::Axis, 1);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0, "输出 shape 与 expected 不符时保守不消除");
+    }
+
+    #[test]
+    fn concat_single_input_to_input() {
+        // Concat([x], axis=0) → 结果等于 x（copy no-op）
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let cat = g.add_node(OpKind::Concat);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("out"),
+            cat,
+        );
+        g.storage.set_node_inputs(cat, &[x]);
+        g.storage.set_node_outputs(cat, &[out]);
+        g.storage.add_attr_int(cat, base::StorageAttrKey::Axis, 0);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 1, "单输入 Concat 应消除为 x");
+        assert_eq!(g.outputs(), &[x], "输出应重写为 x");
+    }
+
+    #[test]
+    fn concat_multi_inputs_not_simplified() {
+        // Concat([x,y], axis=0) 多输入 → NoChange
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("x"),
+        );
+        let y = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![2, 3],
+            },
+            Some("y"),
+        );
+        let cat = g.add_node(OpKind::Concat);
+        let out = g.add_value(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4, 3],
+            },
+            Some("out"),
+            cat,
+        );
+        g.storage.set_node_inputs(cat, &[x, y]);
+        g.storage.set_node_outputs(cat, &[out]);
+        g.storage.add_attr_int(cat, base::StorageAttrKey::Axis, 0);
+        g.mark_output(out);
+        let count = run_algebraic_simplify(&mut g).unwrap();
+        assert_eq!(count, 0, "多输入 Concat 不应消除");
     }
 }

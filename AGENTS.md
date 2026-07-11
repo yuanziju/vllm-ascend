@@ -468,3 +468,44 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 4. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）
 5. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）
 6. CSE 可选增强：可交换 op 集中管理（改 is_commutative 辅助，当前硬编码 Add|Mul，未来加 Max/Min/Equal 时同步）；等价但非字面相同的 IO（如 x+x 与 x*2，依赖 algebra 规范化，当前 pipeline 顺序已对）
+
+### 2026-07-11 — 启发式识别补强（feat/neutron-heuristics）
+
+**当前状态**：用户问"当前纯规则架构是否最优，不是就继续加，加多点启发式识别，主动点"。调研判断：当前是"纯规则 + cost model 辅助"，规则覆盖范围内正确，但缺"启发式主动识别"——很多 no-op 要主动发现而非等规则匹配。本轮主动补 3 个启发式。回归全绿，本分支待合并回 main。
+
+**用户指引**："加多点启发式的识别，因为有时候启发是真的很重要。主动点去加吧"。理解为：不要只做被动规则匹配，要主动识别可消除/可优化的模式。架构相关（lowering/isel）仍不动。
+
+**已完成**（2 commit）：
+- **algebra 加 reduce/concat shape-based no-op 启发式**（commit f58899c）：
+  - `Reduce(x,axis) 当 axis 维 size==1 → ReplaceWith(x)`：沿 size-1 维 sum/mean/max = 该维唯一元素，是 no-op。保守正确实现：额外校验 reduce 输出 shape 已知且等于输入去掉 axis 维后的 shape（标准 reduce 语义），保证 ReplaceWith 后 shape 严格正确。axis 支负值，越界/未知 shape/输出不符时 NoChange。decompose 后 LayerNorm/Softmax 产生大量 reduce，batch=1 或退化维度场景真实可触发。
+  - `Concat([x],axis) 单输入 → ReplaceWith(x)`：单输入 concat 是 copy no-op。
+  - 新增 read_axis 辅助（照 read_perm 模式）。5 新单测（正向/负向/shape 不符保守不消除）
+- **fuse 反融合判定增强**（commit 5f94d90）：当前 fuse 判定过宽（saving>0 就融，CUDA launch=10 几乎所有≥2链都融），缺反融合考量。
+  - CostCoeffs 加 fuse_overhead 字段（CUDA 0.5 / NPU 0.3 / CPU 0.1），fusion_saving 扣除 extra=(n-1)*fuse_overhead 模拟融合后 Fused kernel 寄存器压力（线性近似 spill 风险）。saving = saved_launch + saved_mem - extra，自然提高融合门槛。
+  - fuse.rs 加 MAX_FUSION_CHAIN=16 链长上限，build_fusion_chain 扩展时超 16 截断，避免长链寄存器溢出。
+  - 3 新单测（overhead 扣除 / 长链高 overhead saving 变负 / 20 节点链截断到 16）。现有 7 fuse 测试不回归（链长≤3，extra 远小于 saved_launch+saved_mem）
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace --all-targets -- -D warnings`：0 warning
+- `cargo fmt --all -- --check`：clean
+- `cargo test --workspace`：146 passed（base 3 + common 2 + frontend 23 + interface 5 + isel 12 + lisp 4 + optimizer 97）—— 较上轮 138 +8（5 algebra + 3 fuse）
+- CLI 端到端：`cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump` 正常
+
+**设计哲学遵守**：
+- reduce/concat no-op 是"简单代数规则"的启发式扩展（识别 size-1 维 no-op，非复合算子模式匹配），保守策略（shape 严格校验才消除）
+- fuse 反融合是 cost model 驱动的启发式（寄存器压力近似 + 链长上限），符合"cost model 现在就做"和"启发式优化器"
+- 非贪心模式匹配（reduce no-op 是单节点简化，fuse 反融合是 cost 判定而非模式识别）
+
+**架构判断（回答用户"纯规则架构是否最优"）**：当前架构是"纯规则 + cost model 辅助判定"，在规则覆盖范围内正确，但有 3 类缺口：(1) shape-based no-op 主动识别（本轮补 reduce/concat，还有 Slice 全量等因 AttrKey 缺失推迟）；(2) fuse 反融合判定（本轮补 overhead 扣除 + 链长上限）；(3) 等价但非字面相同的 IO 识别（依赖 algebra 规范化，当前 pipeline 顺序已对，缺的是 algebra 规范化能力）。不是最优，但本轮补的 3 个启发式覆盖了最高价值的缺口。剩余缺口中，Slice no-op 需先补 AttrKey 枚举 + frontend 解析（工作量大），等价 IO 识别依赖 algebra 规范化增强（如 x+x 与 x*2 统一，但这触及"不要模式匹配"红线边界，需谨慎）。
+
+**子代理协作模式**：1 个 search 子代理摸清 algebra/fuse/shape_infer/cost_model 的启发式覆盖现状（含 no-op 场景清单 + fuse cost 判定缺陷 + 缺口优先级），1 个 general_purpose_task 子代理实现 algebra 两个 no-op，1 个 general_purpose_task 子代理实现 fuse 反融合。主 agent 只做 git 提交+验证。上下文未爆。
+
+**下一步**（优先级排序）：
+1. pt 前端：PyTorch 解析（frontend 最后一块占位）
+2. Slice no-op 识别：需先补 AttrKey::Starts/Ends/Axes/Steps + frontend 解析 Slice 属性，工作量大但价值高（Slice 全量是常见 no-op）
+3. fuse 可扩展：reduce + elementwise 更复杂模式
+4. float_opts 可继续：Exp(Log(x))→x 对偶 / Pow(x,3.0) 整数幂扩展
+5. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型（tensor/GraphProto）
+6. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）
+7. CSE 可选：可交换 op 集中管理 / 等价非字面 IO 识别（依赖 algebra 规范化）

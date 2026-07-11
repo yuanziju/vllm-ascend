@@ -22,6 +22,12 @@
 use crate::cost_model::{fusion_saving, CostCoeffs};
 use base::{Graph, OpKind, Result, ValueId};
 
+/// 链长上限：超过此长度的 elementwise 链不融合，避免寄存器 spill。
+/// GPU kernel 寄存器有限，长链融合后单 kernel 寄存器占用过高会触发 spill，
+/// 反而降低性能。16 是经验阈值（典型 GPU 有 255 个寄存器，每 elementwise op
+/// 约需 2-4 个寄存器存中间值，16 op ≈ 32-64 寄存器，留余量给调度器）。
+const MAX_FUSION_CHAIN: usize = 16;
+
 pub struct FusionOpportunity {
     pub nodes: Vec<base::NodeId>,
     /// 各 binary 节点的 side input（按链 head→tail 序），融合后追加到节点 inputs
@@ -135,6 +141,10 @@ fn build_fusion_chain(graph: &Graph, start: base::NodeId) -> Result<ChainResult>
         }
 
         if let Some((pred_id, pred_vin)) = chain_pred {
+            // 链长上限：超长链不融（避免寄存器 spill，见 MAX_FUSION_CHAIN 注释）
+            if chain.len() >= MAX_FUSION_CHAIN {
+                break;
+            }
             // 自引用检测：若 binary 节点的多个 input 都引用链前驱输出
             // （如 add(r, r)），编码无法表示"binary 两输入都取链输出"，放弃融合
             let pred_uses = n_ins.iter().filter(|&&v| v == pred_vin).count();
@@ -725,5 +735,57 @@ mod tests {
 
         let count = apply_fusion(&mut g, CostCoeffs::cuda()).unwrap();
         assert_eq!(count, 0, "自引用 binary（两输入都取链输出）不应融合");
+    }
+
+    #[test]
+    fn fuse_respects_max_chain_length() {
+        // 构造 20 个 relu 链：relu0 -> relu1 -> ... -> relu19
+        // MAX_FUSION_CHAIN = 16，单条链不应超过 16 个 op（避免寄存器 spill）
+        let mut g = Graph::new("test");
+        let x = g.add_input(
+            Type::Tensor {
+                dtype: DType::F32,
+                dims: vec![4],
+            },
+            Some("x"),
+        );
+        g.mark_input(x);
+        let mut prev = x;
+        for i in 0..20 {
+            let relu = g.add_node(OpKind::Relu);
+            let name = format!("r{}", i);
+            let out = g.add_value(
+                Type::Tensor {
+                    dtype: DType::F32,
+                    dims: vec![4],
+                },
+                Some(name.as_str()),
+                relu,
+            );
+            g.storage.set_node_inputs(relu, &[prev]);
+            g.storage.set_node_outputs(relu, &[out]);
+            prev = out;
+        }
+        g.mark_output(prev);
+
+        let opps = find_opportunities(&g, CostCoeffs::cuda()).unwrap();
+        // 每条机会的链长不应超过 MAX_FUSION_CHAIN
+        for opp in &opps {
+            assert!(
+                opp.nodes.len() <= MAX_FUSION_CHAIN,
+                "链长 {} 超过上限 {}（应截断避免寄存器 spill）",
+                opp.nodes.len(),
+                MAX_FUSION_CHAIN
+            );
+        }
+        // 20 节点链应至少被截断成多条机会（不会全融成一条 20 链）
+        // 最长的那条应为 MAX_FUSION_CHAIN（16），因为 CUDA launch 收益高，
+        // 长链即便扣 overhead 仍 saving > 0
+        let max_len = opps.iter().map(|o| o.nodes.len()).max().unwrap_or(0);
+        assert_eq!(
+            max_len, MAX_FUSION_CHAIN,
+            "最长链应为 MAX_FUSION_CHAIN={}，实际 {}",
+            MAX_FUSION_CHAIN, max_len
+        );
     }
 }
