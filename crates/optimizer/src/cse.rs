@@ -3,11 +3,13 @@
 //! 设计哲学：识别"同样的计算"，消除冗余。指纹包含：
 //! - 操作类型 (OpKind)
 //! - 输入 value IDs
-//! - 常量值（对 Constant 节点：值相同的常量合并为一个）
+//! - 属性哈希（Axis/Perm/Shape 等，带 attr 的 op 不再误合并）
+//! - 常量值（单元素常量按值合并；多元素张量按 dims+values 合并）
 //! - 可交换操作规范化（Add/Mul 的输入排序后比较）
 //!
 //! 幂等性识别（relu(relu(x))=relu(x)）属于代数范畴，不在此处做。
-//! CSE 只做"完全相同的子表达式"合并。
+//! CSE 只做"完全相同的子表达式"合并。CsePass::run 含不动点迭代，
+//! 消除后暴露的新机会能多捕一层。
 
 use base::{Graph, OpKind, Result, ValueId};
 use std::collections::HashMap;
@@ -482,5 +484,53 @@ mod tests {
             1,
             "相同值相同 shape 的多元素常量张量应合并"
         );
+    }
+
+    // --- 缺口 C：不动点迭代，消除后暴露的新机会能多捕一层 ---
+
+    #[test]
+    fn cse_fixpoint_catches_newly_exposed() {
+        // 构图：
+        //   a = Add(x, y)
+        //   b = Add(x, y)   ← 第一轮消除，b 的使用者 c 的输入 b→a
+        //   c = Add(a, b)   ← 第一轮后变 Add(a, a)
+        //   d = Add(a, a)   ← 第一轮前就存在，与第一轮后的 c 指纹相同
+        // 单次 CSE 只消除 b，不动点能再消除 c 或 d 之一。
+        let mut g = Graph::new("test");
+        let x = g.add_input(Type::Scalar(DType::F32), Some("x"));
+        let y = g.add_input(Type::Scalar(DType::F32), Some("y"));
+
+        let a = g.add_node(OpKind::Add);
+        let a_out = g.add_value(Type::Scalar(DType::F32), Some("a"), a);
+        g.storage.set_node_inputs(a, &[x, y]);
+        g.storage.set_node_outputs(a, &[a_out]);
+
+        let b = g.add_node(OpKind::Add);
+        let b_out = g.add_value(Type::Scalar(DType::F32), Some("b"), b);
+        g.storage.set_node_inputs(b, &[x, y]);
+        g.storage.set_node_outputs(b, &[b_out]);
+
+        let c = g.add_node(OpKind::Add);
+        let c_out = g.add_value(Type::Scalar(DType::F32), Some("c"), c);
+        g.storage.set_node_inputs(c, &[a_out, b_out]);
+        g.storage.set_node_outputs(c, &[c_out]);
+
+        let d = g.add_node(OpKind::Add);
+        let d_out = g.add_value(Type::Scalar(DType::F32), Some("d"), d);
+        g.storage.set_node_inputs(d, &[a_out, a_out]);
+        g.storage.set_node_outputs(d, &[d_out]);
+
+        g.mark_output(c_out);
+        g.mark_output(d_out);
+
+        // 单次 apply_cse 只消除 b（1 个），不动点应消除 2 个（b + c/d 之一）
+        let n1 = apply_cse(&mut g).unwrap();
+        assert_eq!(n1, 1, "第一轮应消除 b");
+        // 第二轮：c 的输入已 b→a，c=Add(a,a) 与 d=Add(a,a) 指纹相同，再消除 1 个
+        let n2 = apply_cse(&mut g).unwrap();
+        assert_eq!(n2, 1, "第二轮应消除 c 或 d（不动点暴露的新机会）");
+        // 第三轮应无变化
+        let n3 = apply_cse(&mut g).unwrap();
+        assert_eq!(n3, 0, "第三轮应收敛");
     }
 }
