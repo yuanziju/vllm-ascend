@@ -78,7 +78,8 @@ fn rewrite_value_uses(graph: &mut Graph, replacements: &HashMap<ValueId, ValueId
     let lookup = |v: ValueId| -> ValueId { replacements.get(&v).copied().unwrap_or(v) };
     let node_ids: Vec<NodeId> = graph.node_ids().collect();
     for nid in node_ids {
-        let old_inputs: Vec<ValueId> = graph.node(nid).unwrap().inputs().to_vec();
+        let Ok(node) = graph.node(nid) else { continue; };
+        let old_inputs: Vec<ValueId> = node.inputs().to_vec();
         let new_inputs: Vec<ValueId> = old_inputs.iter().map(|&v| lookup(v)).collect();
         if old_inputs != new_inputs {
             graph.storage.set_node_inputs(nid, &new_inputs);

@@ -23,7 +23,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         print_usage();
-        process::exit(1);
+        process::exit(2);
     }
 
     let input_path = &args[1];
@@ -47,32 +47,36 @@ fn main() {
         match args[i].as_str() {
             "--target" => {
                 i += 1;
-                if i < args.len() {
-                    target = match args[i].as_str() {
-                        "cuda" => common::Target::Cuda,
-                        "npu" => common::Target::Npu,
-                        "cpu" => common::Target::Cpu,
-                        _ => {
-                            eprintln!("未知 target: {} (可选: cuda, npu, cpu)", args[i]);
-                            process::exit(1);
-                        }
-                    };
+                if i >= args.len() {
+                    eprintln!("--target 需要值 (可选: cuda, npu, cpu)");
+                    process::exit(2);
                 }
+                target = match args[i].as_str() {
+                    "cuda" => common::Target::Cuda,
+                    "npu" => common::Target::Npu,
+                    "cpu" => common::Target::Cpu,
+                    _ => {
+                        eprintln!("未知 target: {} (可选: cuda, npu, cpu)", args[i]);
+                        process::exit(2);
+                    }
+                };
             }
             "--opt" => {
                 i += 1;
-                if i < args.len() {
-                    opt_level = match args[i].as_str() {
-                        "0" => common::OptLevel::O0,
-                        "1" => common::OptLevel::O1,
-                        "2" => common::OptLevel::O2,
-                        "3" => common::OptLevel::O3,
-                        _ => {
-                            eprintln!("未知 opt level: {} (可选: 0, 1, 2, 3)", args[i]);
-                            process::exit(1);
-                        }
-                    };
+                if i >= args.len() {
+                    eprintln!("--opt 需要值 (可选: 0, 1, 2, 3)");
+                    process::exit(2);
                 }
+                opt_level = match args[i].as_str() {
+                    "0" => common::OptLevel::O0,
+                    "1" => common::OptLevel::O1,
+                    "2" => common::OptLevel::O2,
+                    "3" => common::OptLevel::O3,
+                    _ => {
+                        eprintln!("未知 opt level: {} (可选: 0, 1, 2, 3)", args[i]);
+                        process::exit(2);
+                    }
+                };
             }
             "--dump" => {
                 dump_ir = true;
@@ -88,7 +92,7 @@ fn main() {
             _ => {
                 eprintln!("未知参数: {}", args[i]);
                 eprintln!("运行 neutron --help 查看用法");
-                process::exit(1);
+                process::exit(2);
             }
         }
         i += 1;

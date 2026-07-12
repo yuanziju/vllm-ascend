@@ -57,10 +57,27 @@ jobs:
         run: cargo build --workspace --all-targets
       - name: cargo test --workspace
         run: cargo test --workspace --all-targets
+      - name: cargo test --doc
+        run: cargo test --workspace --doc
       - name: CLI 端到端
         run: |
+          set -e
+          NEUTRON=./target/debug/neutron
           # 空输入应能跑通整个 pipeline（frontend → optimizer → arch → isel → regalloc → backend）
-          cargo run -p cli -- /dev/null --target cuda --opt 2 --dump || true
+          $NEUTRON /dev/null --target cuda --opt 2 --dump > /dev/null 2>&1
+          # --version / --help 标志
+          $NEUTRON --version | grep -q "^neutron "
+          $NEUTRON -V | grep -q "^neutron "
+          $NEUTRON --help 2>&1 | grep -q "用法: neutron"
+          $NEUTRON -h 2>&1 | grep -q "用法: neutron"
+          # 用法错误必须退出码 2
+          set +e
+          $NEUTRON > /dev/null 2>&1; code=$?; [ $code -eq 2 ] || { echo "no-args exit=$code (want 2)"; exit 1; }
+          $NEUTRON /dev/null --target > /dev/null 2>&1; code=$?; [ $code -eq 2 ] || { echo "--target-missing exit=$code (want 2)"; exit 1; }
+          $NEUTRON /dev/null --opt > /dev/null 2>&1; code=$?; [ $code -eq 2 ] || { echo "--opt-missing exit=$code (want 2)"; exit 1; }
+          $NEUTRON /dev/null --bogus > /dev/null 2>&1; code=$?; [ $code -eq 2 ] || { echo "unknown-flag exit=$code (want 2)"; exit 1; }
+          set -e
+          echo "CLI smoke tests passed"
 
   # 文档构建（doc-test + 链接检查）
   docs:
