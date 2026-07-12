@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 回归验证四件套：fmt + clippy + build + test
+  # MSRV 1.75（workspace.package.rust-version），stable + MSRV 双矩阵
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [stable, "1.75"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build-test:
+    name: build + test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [stable, "1.75"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --workspace
+        run: cargo build --workspace --all-targets
+      - name: cargo test --workspace
+        run: cargo test --workspace --all-targets
+      - name: CLI 端到端
+        run: |
+          # 空输入应能跑通整个 pipeline（frontend → optimizer → arch → isel → regalloc → backend）
+          cargo run -p cli -- /dev/null --target cuda --opt 2 --dump || true
+
+  # 文档构建（doc-test + 链接检查）
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

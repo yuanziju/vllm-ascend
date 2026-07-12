@@ -38,7 +38,7 @@ use isel::Instruction;
 /// 节点输出 → MachineInstr 的 defs；节点输入 → MachineInstr 的 operands。
 ///
 /// arch::lower 和 isel::select 都保持节点顺序遍历，
-/// 所以 instructions[i] 对应 graph 的第 i 个节点。
+/// 所以 `instructions[i]` 对应 graph 的第 i 个节点。
 pub fn lower_to_machine(graph: &Graph, instructions: &[Instruction]) -> Vec<MachineInstr> {
     let mut vreg_map: HashMap<ValueId, VReg> = HashMap::new();
     let mut next_vreg = 0u32;

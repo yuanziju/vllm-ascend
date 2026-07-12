@@ -399,7 +399,7 @@ impl StorageGraph {
     /// 读取属性 int array。
     ///
     /// # Safety
-    /// 前提：attr_data 是 Vec<u8>，对齐 1。强转 &[i64] 需对齐 8。
+    /// 前提：attr_data 是 `Vec<u8>`，对齐 1。强转 `&[i64]` 需对齐 8。
     /// 生产环境应保证 attr_data 按 8 对齐分配。此处简化用 unsafe。
     #[inline]
     pub fn attr_int_array(&self, entry: &AttrEntry) -> &[i64] {
