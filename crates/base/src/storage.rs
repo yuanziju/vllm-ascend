@@ -76,7 +76,7 @@ pub enum AttrKey {
     Shape = 10,
     /// Constant 节点的标量值（Float tag），用于代数折叠/识别 0/1
     Value = 11,
-    /// Transpose 的轴排列序列（IntArray tag），如 [1,0,2]
+    /// Transpose 的轴排列序列（IntArray tag），如 `[1, 0, 2]`
     Perm = 12,
     Custom = 255,
 }

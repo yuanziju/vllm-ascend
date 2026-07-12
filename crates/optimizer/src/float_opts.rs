@@ -27,11 +27,11 @@
 //! - **PowSquareToMul**：`Pow(x, 2.0)` → `Mul(x, x)`。x²=x·x，通用幂（用 log/exp
 //!   实现的超越函数，贵）换成便宜乘法。无溢出/NaN 风险（数学完全等价）
 //! - **PowCubeToMul**：`Pow(x, 3.0)` → `Mul(x, Mul(x, x))`。x³=x·x·x，通用幂
-//!   换成两次便宜乘法。新建内层 Mul(x,x) 节点，Pow 节点改外层 Mul 吃 [x, x²]。
+//!   换成两次便宜乘法。新建内层 Mul(x,x) 节点，Pow 节点改外层 Mul 吃 `x` 和 `x²`。
 //!   无溢出/NaN 风险（数学完全等价）
 //! - **PowNegTwoToReciprocal**：`Pow(x, -2.0)` → `Reciprocal(Mul(x, x))`。
 //!   x^(-2)=1/x²=reciprocal(x²)，通用幂换成 Mul + Reciprocal（都是单条硬件指令）。
-//!   新建 Mul(x,x)，Pow 改 Reciprocal 吃 [mul_out]。RMSNorm/L2 归一化常见
+//!   新建 Mul(x,x)，Pow 改 Reciprocal 吃 `mul_out`。RMSNorm/L2 归一化常见
 //! - **SqrtSquareToAbs**：`Sqrt(x*x)` → `Abs(x)`。√(x²)=|x|，Sqrt+Mul 换单条
 //!   Abs 硬件指令。两输入相同（x*x）才匹配，x*y 无简化。L2 norm 的 sqrt(x·x) 常见
 //! - **LogExpToIdentity**：`Log(Exp(x))` → `x`。ln(eˣ)=x，消去 Log+Exp 两个 op。
@@ -151,7 +151,7 @@ pub enum FloatOpt {
     },
     /// `Pow(x, -2.0)` → `Reciprocal(Mul(x, x))`：x^(-2)=1/x²=reciprocal(x²)。
     /// 通用幂换成 Mul + Reciprocal（都是单条硬件指令）。新建 Mul(x,x)，
-    /// Pow 改 Reciprocal 吃 [mul_out]。无溢出/NaN 风险（x=0 时原 Pow 也是 inf，重写后 Reciprocal(0)=inf 一致）
+    /// Pow 改 Reciprocal 吃 `mul_out`。无溢出/NaN 风险（x=0 时原 Pow 也是 inf，重写后 Reciprocal(0)=inf 一致）
     PowNegTwoToReciprocal {
         pow_node: base::NodeId, // 主操作节点（原 Pow），改 Reciprocal
         base: ValueId,          // 底数 x，新建的 Mul(x,x) 用它

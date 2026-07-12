@@ -272,7 +272,7 @@ impl<'a> NodeView<'a> {
     /// 支持两种存储形式：
     /// - `Value=Float`（标量常量，由 `add_constant_f64` 创建）——直接返回
     /// - `Value=FloatArray` 且恰好 1 个元素（单元素张量常量，如 ONNX initializer
-    ///   shape=[] 或 [1]）——返回该元素，让 algebra/float_opts 等基于标量的 pass
+    ///   shape=`[]` 或 `[1]`）——返回该元素，让 algebra/float_opts 等基于标量的 pass
     ///   也能识别从 ONNX 读入的广播标量
     ///
     /// 多元素张量常量返回 None（用 `constant_tensor` 取完整数据）。

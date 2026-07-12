@@ -1,7 +1,7 @@
 //! onnx — ONNX 解析（手写 protobuf wire-format，无 prost 依赖）
 //!
 //! 设计哲学：不引入 prost/prost-build（重依赖 + protoc 代码生成），手写
-//! 一个只够用的 protobuf 解码器（见 [`proto`]），解出 ONNX ModelProto →
+//! 一个只够用的 protobuf 解码器（见 `proto` 模块），解出 ONNX ModelProto →
 //! GraphProto → NodeProto 的关键字段（op_type / input / output / name），
 //! 构建 Neutron 架构无关图。
 //!
