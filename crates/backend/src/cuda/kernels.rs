@@ -1245,10 +1245,10 @@ mod tests {
     #[test]
     fn test_generate_constant_with_value() {
         let mut spec = make_spec("neutron_constant_0", OpKind::Constant);
-        spec.attrs.value = Some(3.14);
+        spec.attrs.value = Some(2.71);
         let out = generate(&[spec], GpuArch::Hopper90).unwrap();
         assert!(out.source.contains("__global__"));
-        assert!(out.source.contains("3.14"));
+        assert!(out.source.contains("2.71"));
         // launch wrapper 应传递 value
         assert!(out.source.contains("launch_neutron_constant_0"));
     }

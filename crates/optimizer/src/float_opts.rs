@@ -435,22 +435,26 @@ fn try_match_pow_half(graph: &Graph, pow: NodeView) -> Result<Option<FloatOpt>> 
         return Ok(None);
     }
     let (base, exp) = (ins[0], ins[1]);
-    match constant_value(graph, exp)? {
-        Some(0.5) => Ok(Some(FloatOpt::PowHalfToSqrt {
+    let exp_val = constant_value(graph, exp)?;
+    if exp_val == Some(0.5) {
+        Ok(Some(FloatOpt::PowHalfToSqrt {
             pow_node: pow.id,
             base,
             is_negative: false,
-        })),
-        Some(-0.5) => Ok(Some(FloatOpt::PowHalfToSqrt {
+        }))
+    } else if exp_val == Some(-0.5) {
+        Ok(Some(FloatOpt::PowHalfToSqrt {
             pow_node: pow.id,
             base,
             is_negative: true,
-        })),
-        Some(-1.0) => Ok(Some(FloatOpt::PowNegOneToReciprocal {
+        }))
+    } else if exp_val == Some(-1.0) {
+        Ok(Some(FloatOpt::PowNegOneToReciprocal {
             pow_node: pow.id,
             base,
-        })),
-        _ => Ok(None),
+        }))
+    } else {
+        Ok(None)
     }
 }
 
