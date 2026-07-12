@@ -9,12 +9,13 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn print_usage() {
     eprintln!("neutron v{} — ONNX → GPU/NPU kernel 编译器", VERSION);
     eprintln!();
-    eprintln!("用法: neutron <input.onnx> [--target cuda|npu|cpu] [--opt 0|1|2|3] [--dump] [--help] [--version]");
+    eprintln!("用法: neutron <input.onnx> [--target cuda|npu|cpu] [--opt 0|1|2|3] [--dump] [-o <file>] [--help] [--version]");
     eprintln!();
     eprintln!("选项:");
     eprintln!("  --target <t>   目标后端: cuda (NVIDIA), npu (昇腾), cpu (回退)");
     eprintln!("  --opt <n>      优化等级: 0=关闭, 1=基础, 2=默认, 3=激进");
     eprintln!("  --dump         输出 IR 调试信息到 stderr");
+    eprintln!("  -o <file>      后端源码写入文件 (默认写 stdout)");
     eprintln!("  --help, -h     显示帮助");
     eprintln!("  --version, -V  显示版本号");
 }
@@ -41,6 +42,7 @@ fn main() {
     let mut target = common::Target::Cuda;
     let mut opt_level = common::OptLevel::O2;
     let mut dump_ir = false;
+    let mut output_path: Option<String> = None;
 
     let mut i = 2;
     while i < args.len() {
@@ -77,6 +79,14 @@ fn main() {
                         process::exit(2);
                     }
                 };
+            }
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("-o 需要值 (输出文件路径)");
+                    process::exit(2);
+                }
+                output_path = Some(args[i].clone());
             }
             "--dump" => {
                 dump_ir = true;
@@ -117,7 +127,13 @@ fn main() {
                 eprintln!("{}", debug);
             }
             if let Some(src) = &out.backend_source {
-                println!("{}", src);
+                match &output_path {
+                    Some(path) => fs::write(path, src).unwrap_or_else(|e| {
+                        eprintln!("写入 {} 失败: {}", path, e);
+                        process::exit(1);
+                    }),
+                    None => println!("{}", src),
+                }
             }
             eprintln!("target: {}", out.target);
             eprintln!("instructions: {}", out.instructions.len());

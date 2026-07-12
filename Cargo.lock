@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "arch"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base",
  "common",
@@ -12,7 +12,7 @@ dependencies = [
 
 [[package]]
 name = "backend"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base",
  "common",
@@ -22,14 +22,14 @@ dependencies = [
 
 [[package]]
 name = "base"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "common",
  "interface",
@@ -37,14 +37,14 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base",
 ]
 
 [[package]]
 name = "frontend"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base",
  "common",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "interface"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arch",
  "backend",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "isel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arch",
  "base",
@@ -76,11 +76,11 @@ dependencies = [
 
 [[package]]
 name = "lisp"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "optimizer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base",
  "common",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "regalloc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base",
  "common",

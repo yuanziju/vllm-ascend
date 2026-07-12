@@ -70,11 +70,16 @@ jobs:
           $NEUTRON -V | grep -q "^neutron "
           $NEUTRON --help 2>&1 | grep -q "用法: neutron"
           $NEUTRON -h 2>&1 | grep -q "用法: neutron"
+          # -o 输出到文件
+          $NEUTRON /dev/null --target cuda --opt 2 -o /tmp/out.cu > /dev/null 2>&1
+          test -s /tmp/out.cu
+          grep -q "neutron" /tmp/out.cu
           # 用法错误必须退出码 2
           set +e
           $NEUTRON > /dev/null 2>&1; code=$?; [ $code -eq 2 ] || { echo "no-args exit=$code (want 2)"; exit 1; }
           $NEUTRON /dev/null --target > /dev/null 2>&1; code=$?; [ $code -eq 2 ] || { echo "--target-missing exit=$code (want 2)"; exit 1; }
           $NEUTRON /dev/null --opt > /dev/null 2>&1; code=$?; [ $code -eq 2 ] || { echo "--opt-missing exit=$code (want 2)"; exit 1; }
+          $NEUTRON /dev/null -o > /dev/null 2>&1; code=$?; [ $code -eq 2 ] || { echo "-o-missing exit=$code (want 2)"; exit 1; }
           $NEUTRON /dev/null --bogus > /dev/null 2>&1; code=$?; [ $code -eq 2 ] || { echo "unknown-flag exit=$code (want 2)"; exit 1; }
           set -e
           echo "CLI smoke tests passed"
