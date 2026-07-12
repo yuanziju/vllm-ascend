@@ -5,8 +5,8 @@
 //! 打包成 KernelSpec 供后端代码生成器使用。
 
 use crate::spec::*;
-use base::{Graph, NodeView, OpKind};
 use base::storage::AttrTag;
+use base::{Graph, NodeView, OpKind};
 
 /// 从 IR Graph 提取所有计算节点的 KernelSpec
 ///
@@ -36,11 +36,7 @@ fn extract_one(graph: &Graph, node: &NodeView, idx: u32) -> KernelSpec {
         .map(|&vid| extract_tensor(graph, vid, false))
         .collect();
     let attrs = extract_attrs(node);
-    let dtype = outputs
-        .first()
-        .map(|t| t.dtype)
-        .unwrap_or(base::DType::F32)
-        .clone();
+    let dtype = outputs.first().map(|t| t.dtype).unwrap_or(base::DType::F32);
 
     KernelSpec {
         name: format!("neutron_{}_{}", op_short_name(node.kind), idx),

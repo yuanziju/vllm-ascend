@@ -11,15 +11,15 @@
 //!
 //! 每个 OpKind（31 个变体）在每个后端都有真实实现，无空缺。
 
-pub mod spec;
-pub mod extract;
-pub mod cuda;
-pub mod triton;
-pub mod metal;
 pub mod cann;
+pub mod cuda;
+pub mod extract;
+pub mod metal;
+pub mod spec;
+pub mod triton;
 
-pub use spec::*;
 pub use extract::*;
+pub use spec::*;
 
 use base::Graph;
 use common::Target;
@@ -51,11 +51,7 @@ pub fn emit(
 }
 
 /// 生成指定后端的源码（直接指定后端类型，不走 Target 映射）
-pub fn emit_for(
-    graph: &Graph,
-    lang: SourceLang,
-    arch: GpuArch,
-) -> base::Result<BackendOutput> {
+pub fn emit_for(graph: &Graph, lang: SourceLang, arch: GpuArch) -> base::Result<BackendOutput> {
     let kernels = extract_kernels(graph);
     match lang {
         SourceLang::Cuda => cuda::emit(&kernels, arch),

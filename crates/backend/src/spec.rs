@@ -87,18 +87,12 @@ impl GpuArch {
 
     /// 是否支持 simdgroup_matrix
     pub fn has_simdgroup(self) -> bool {
-        matches!(
-            self,
-            GpuArch::Apple6 | GpuArch::Apple7 | GpuArch::Apple8
-        )
+        matches!(self, GpuArch::Apple6 | GpuArch::Apple7 | GpuArch::Apple8)
     }
 
     /// 是否支持 Cube Core（矩阵专用单元）
     pub fn has_cube_core(self) -> bool {
-        matches!(
-            self,
-            GpuArch::Ascend910B1 | GpuArch::Ascend910B3
-        )
+        matches!(self, GpuArch::Ascend910B1 | GpuArch::Ascend910B3)
     }
 
     pub fn name(self) -> &'static str {
@@ -131,7 +125,11 @@ pub struct TensorSpec {
 
 impl TensorSpec {
     pub fn element_count(&self) -> usize {
-        self.dims.iter().filter(|d| **d > 0).map(|d| *d as usize).product()
+        self.dims
+            .iter()
+            .filter(|d| **d > 0)
+            .map(|d| *d as usize)
+            .product()
     }
 
     pub fn bytes(&self) -> usize {
@@ -249,7 +247,7 @@ impl KernelSpec {
             | base::OpKind::Log => {
                 let n = self.first_output_len();
                 let block = 256u32;
-                let grid = ((n as u32 + block - 1) / block).max(1);
+                let grid = (n as u32).div_ceil(block).max(1);
                 LaunchSpec {
                     grid: (grid, 1, 1),
                     block: (block, 1, 1),
@@ -257,9 +255,7 @@ impl KernelSpec {
                 }
             }
             // reduce：每 block 算一个 reduce 输出
-            base::OpKind::ReduceSum
-            | base::OpKind::ReduceMean
-            | base::OpKind::ReduceMax => {
+            base::OpKind::ReduceSum | base::OpKind::ReduceMean | base::OpKind::ReduceMax => {
                 let block = 256u32;
                 let n = self.first_output_len().max(1) as u32;
                 LaunchSpec {
@@ -313,7 +309,7 @@ impl KernelSpec {
             base::OpKind::Pool => {
                 let block = 256u32;
                 let n = self.first_output_len();
-                let grid = ((n as u32 + block - 1) / block).max(1);
+                let grid = (n as u32).div_ceil(block).max(1);
                 LaunchSpec {
                     grid: (grid, 1, 1),
                     block: (block, 1, 1),
@@ -327,7 +323,7 @@ impl KernelSpec {
             | base::OpKind::Slice => {
                 let n = self.first_output_len();
                 let block = 256u32;
-                let grid = ((n as u32 + block - 1) / block).max(1);
+                let grid = (n as u32).div_ceil(block).max(1);
                 LaunchSpec {
                     grid: (grid, 1, 1),
                     block: (block, 1, 1),
@@ -338,7 +334,7 @@ impl KernelSpec {
             base::OpKind::Fused | base::OpKind::Custom => {
                 let n = self.first_output_len();
                 let block = 256u32;
-                let grid = ((n as u32 + block - 1) / block).max(1);
+                let grid = (n as u32).div_ceil(block).max(1);
                 LaunchSpec {
                     grid: (grid, 1, 1),
                     block: (block, 1, 1),
@@ -346,21 +342,18 @@ impl KernelSpec {
                 }
             }
             // Constant / Placeholder / Return：不需要 launch
-            base::OpKind::Constant
-            | base::OpKind::Placeholder
-            | base::OpKind::Return => LaunchSpec {
-                grid: (1, 1, 1),
-                block: (1, 1, 1),
-                shared_mem: 0,
-            },
+            base::OpKind::Constant | base::OpKind::Placeholder | base::OpKind::Return => {
+                LaunchSpec {
+                    grid: (1, 1, 1),
+                    block: (1, 1, 1),
+                    shared_mem: 0,
+                }
+            }
         }
     }
 
     fn first_output_len(&self) -> usize {
-        self.outputs
-            .first()
-            .map(|t| t.element_count())
-            .unwrap_or(0)
+        self.outputs.first().map(|t| t.element_count()).unwrap_or(0)
     }
 }
 
@@ -381,10 +374,7 @@ impl LaunchSpec {
         format!("dim3({}, {}, {})", self.grid.0, self.grid.1, self.grid.2)
     }
     pub fn block_str(&self) -> String {
-        format!(
-            "dim3({}, {}, {})",
-            self.block.0, self.block.1, self.block.2
-        )
+        format!("dim3({}, {}, {})", self.block.0, self.block.1, self.block.2)
     }
 }
 
@@ -395,10 +385,10 @@ impl LaunchSpec {
 /// 源码语言
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceLang {
-    Cuda,    // .cu
-    Triton,  // .py
-    Metal,   // .metal (MSL)
-    Cann,    // .cpp
+    Cuda,   // .cu
+    Triton, // .py
+    Metal,  // .metal (MSL)
+    Cann,   // .cpp
 }
 
 impl SourceLang {

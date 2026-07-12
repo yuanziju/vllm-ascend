@@ -66,9 +66,7 @@ fn make_header(arch: GpuArch, count: usize) -> String {
     } else if matches!(arch, GpuArch::Ampere80) {
         s.push_str("# 特性: Ampere 标准 tl.dot（BLOCK_M=BLOCK_N=64, BLOCK_K=32）\n");
     } else {
-        s.push_str(
-            "# 注: Triton 主要面向 NVIDIA GPU；非 NVIDIA 架构仍生成通用 Triton 代码\n",
-        );
+        s.push_str("# 注: Triton 主要面向 NVIDIA GPU；非 NVIDIA 架构仍生成通用 Triton 代码\n");
     }
     s.push_str("# ============================================================\n\n");
     s.push_str("import triton\n");
@@ -641,8 +639,7 @@ def __NAME__(INPUT_PTR, OUTPUT_PTR, N, BLOCK_SIZE: tl.constexpr):
     x = tl.load(INPUT_PTR + offs, mask=mask)
     tl.store(OUTPUT_PTR + offs, x, mask=mask)
 "#;
-    tmpl.replace("__NAME__", name)
-        .replace("__DT__", dt)
+    tmpl.replace("__NAME__", name).replace("__DT__", dt)
 }
 
 /// Transpose kernel：2D tile 转置，`output[col, row] = input[row, col]`。
@@ -662,8 +659,7 @@ def __NAME__(INPUT_PTR, OUTPUT_PTR, H, W, BLOCK_M: tl.constexpr, BLOCK_N: tl.con
     # 转置写回：output[col, row] = input[row, col]
     tl.store(OUTPUT_PTR + offs_n[:, None] * H + offs_m[None, :], tl.trans(x), mask=mask)
 "#;
-    tmpl.replace("__NAME__", name)
-        .replace("__DT__", dt)
+    tmpl.replace("__NAME__", name).replace("__DT__", dt)
 }
 
 /// Concat kernel：沿 axis 拼接，每 program 处理一段输出，
@@ -707,8 +703,7 @@ def __NAME__(INPUT_PTR, OUTPUT_PTR, START, STEP, OUT_N, BLOCK_SIZE: tl.constexpr
     x = tl.load(INPUT_PTR + src_offs, mask=mask)
     tl.store(OUTPUT_PTR + offs, x, mask=mask)
 "#;
-    tmpl.replace("__NAME__", name)
-        .replace("__DT__", dt)
+    tmpl.replace("__NAME__", name).replace("__DT__", dt)
 }
 
 // ---------------------------------------------------------------------------
@@ -748,8 +743,7 @@ def __NAME__(INPUT_PTR, OUTPUT_PTR, N, BLOCK_SIZE: tl.constexpr):
     x = tl.load(INPUT_PTR + offs, mask=mask)
     tl.store(OUTPUT_PTR + offs, x, mask=mask)
 "#;
-    tmpl.replace("__NAME__", name)
-        .replace("__DT__", dt)
+    tmpl.replace("__NAME__", name).replace("__DT__", dt)
 }
 
 /// Return kernel：图输出，identity 拷贝保证数据落盘。
@@ -765,8 +759,7 @@ def __NAME__(INPUT_PTR, OUTPUT_PTR, N, BLOCK_SIZE: tl.constexpr):
     x = tl.load(INPUT_PTR + offs, mask=mask)
     tl.store(OUTPUT_PTR + offs, x, mask=mask)
 "#;
-    tmpl.replace("__NAME__", name)
-        .replace("__DT__", dt)
+    tmpl.replace("__NAME__", name).replace("__DT__", dt)
 }
 
 // ---------------------------------------------------------------------------
@@ -895,12 +888,9 @@ mod tests {
             _ => {}
         }
         let inputs = match op {
-            OpKind::Add
-            | OpKind::Sub
-            | OpKind::Mul
-            | OpKind::Div
-            | OpKind::Pow
-            | OpKind::Fused => vec![tensor.clone(), tensor.clone()],
+            OpKind::Add | OpKind::Sub | OpKind::Mul | OpKind::Div | OpKind::Pow | OpKind::Fused => {
+                vec![tensor.clone(), tensor.clone()]
+            }
             OpKind::Concat => vec![tensor.clone(), tensor.clone()],
             _ => vec![tensor],
         };
@@ -984,7 +974,10 @@ mod tests {
     fn test_emit_elementwise() {
         let specs = vec![make_spec(OpKind::Add, 0)];
         let out = emit(&specs, GpuArch::Hopper90).expect("emit 失败");
-        assert!(out.source.contains("@triton.jit"), "应包含 @triton.jit 装饰器");
+        assert!(
+            out.source.contains("@triton.jit"),
+            "应包含 @triton.jit 装饰器"
+        );
         assert!(out.source.contains("tl.load"), "应包含 tl.load");
         assert!(out.source.contains("tl.store"), "应包含 tl.store");
         assert!(out.source.contains("neutron_add_0"));
@@ -1016,8 +1009,14 @@ mod tests {
             lower.contains("tma") || lower.contains("make_block_ptr"),
             "Hopper MatMul 必须用 TMA 或 make_block_ptr"
         );
-        assert!(out.source.contains("boundary_check"), "Hopper TMA 应有 boundary_check");
-        assert!(out.source.contains("tl.advance"), "Hopper TMA 应有 tl.advance");
+        assert!(
+            out.source.contains("boundary_check"),
+            "Hopper TMA 应有 boundary_check"
+        );
+        assert!(
+            out.source.contains("tl.advance"),
+            "Hopper TMA 应有 tl.advance"
+        );
         assert!(out.source.contains("SM90 TMA"));
     }
 
@@ -1026,7 +1025,10 @@ mod tests {
         let specs = vec![make_spec(OpKind::MatMul, 4)];
         let out = emit(&specs, GpuArch::Blackwell100).expect("emit 失败");
         assert!(out.source.contains("SM100"), "Blackwell 应有 SM100 注释");
-        assert!(out.source.contains("FP4/FP6"), "Blackwell 应有 FP4/FP6 注释");
+        assert!(
+            out.source.contains("FP4/FP6"),
+            "Blackwell 应有 FP4/FP6 注释"
+        );
         assert!(out.source.contains("make_block_ptr"));
     }
 
@@ -1034,7 +1036,10 @@ mod tests {
     fn test_emit_softmax() {
         let specs = vec![make_spec(OpKind::Softmax, 9)];
         let out = emit(&specs, GpuArch::Hopper90).expect("emit 失败");
-        assert!(out.source.contains("tl.max"), "softmax 必须有 tl.max（数值稳定）");
+        assert!(
+            out.source.contains("tl.max"),
+            "softmax 必须有 tl.max（数值稳定）"
+        );
         assert!(out.source.contains("tl.exp"), "softmax 必须有 tl.exp");
         assert!(out.source.contains("tl.sum"), "softmax 必须有 tl.sum");
         assert!(out.source.contains("@triton.jit"));
@@ -1111,11 +1116,17 @@ mod tests {
         ];
         let out = emit(&specs, GpuArch::Ampere80).expect("emit 失败");
         // Add: launch(x, y, out, n)
-        assert!(out.source.contains("def launch_neutron_add_0(x, y, out, n):"));
+        assert!(out
+            .source
+            .contains("def launch_neutron_add_0(x, y, out, n):"));
         // MatMul: launch(a, b, c, m, n, k)
-        assert!(out.source.contains("def launch_neutron_matmul_4(a, b, c, m, n, k):"));
+        assert!(out
+            .source
+            .contains("def launch_neutron_matmul_4(a, b, c, m, n, k):"));
         // Softmax: launch(x, out, n_cols, n_rows)
-        assert!(out.source.contains("def launch_neutron_softmax_9(x, out, n_cols, n_rows):"));
+        assert!(out
+            .source
+            .contains("def launch_neutron_softmax_9(x, out, n_cols, n_rows):"));
     }
 
     #[test]
@@ -1123,7 +1134,10 @@ mod tests {
         // 验证 dtype 注释出现在 source 中
         let specs = vec![make_spec(OpKind::Relu, 5)];
         let out = emit(&specs, GpuArch::Ampere80).expect("emit 失败");
-        assert!(out.source.contains("tl.float32"), "F32 dtype 应映射到 tl.float32");
+        assert!(
+            out.source.contains("tl.float32"),
+            "F32 dtype 应映射到 tl.float32"
+        );
         assert!(out.source.contains("tl.where(x > 0, x, 0.0)"));
     }
 
@@ -1144,12 +1158,7 @@ mod tests {
         ] {
             let specs = vec![make_spec(op, 0)];
             let out = emit(&specs, GpuArch::Ampere80).expect("emit 失败");
-            assert!(
-                out.source.contains(needle),
-                "{:?} 应包含 {:?}",
-                op,
-                needle
-            );
+            assert!(out.source.contains(needle), "{:?} 应包含 {:?}", op, needle);
         }
     }
 }

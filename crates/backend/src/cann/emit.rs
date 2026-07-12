@@ -160,7 +160,14 @@ fn class_name(spec: &KernelSpec) -> String {
         .chars()
         .enumerate()
         .map(|(i, c)| {
-            if i == 0 || !spec.name.as_bytes().get(i - 1).map(|b| *b == b'_').unwrap_or(false) {
+            if i == 0
+                || !spec
+                    .name
+                    .as_bytes()
+                    .get(i - 1)
+                    .map(|b| *b == b'_')
+                    .unwrap_or(false)
+            {
                 c.to_ascii_uppercase()
             } else {
                 c
@@ -581,7 +588,8 @@ extern "C" __global__ __aicore__ void __NAME__(GM_ADDR x, GM_ADDR z,
     op.Process();
 }
 "#;
-    tmpl.replace("__NAME__", &spec.name).replace("__CLS__", &cls)
+    tmpl.replace("__NAME__", &spec.name)
+        .replace("__CLS__", &cls)
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +749,8 @@ extern "C" __global__ __aicore__ void __NAME__(GM_ADDR x, GM_ADDR w, GM_ADDR b, 
     op.Process();
 }
 "#;
-    tmpl.replace("__NAME__", &spec.name).replace("__CLS__", &cls)
+    tmpl.replace("__NAME__", &spec.name)
+        .replace("__CLS__", &cls)
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +815,8 @@ extern "C" __global__ __aicore__ void __NAME__(GM_ADDR x, GM_ADDR y,
     op.Process();
 }
 "#;
-    tmpl.replace("__NAME__", &spec.name).replace("__CLS__", &cls)
+    tmpl.replace("__NAME__", &spec.name)
+        .replace("__CLS__", &cls)
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,10 +1465,22 @@ mod tests {
     fn test_emit_elementwise() {
         let specs = vec![make_spec(OpKind::Add, 0)];
         let out = emit(&specs, GpuArch::Ascend910B1).expect("emit 失败");
-        assert!(out.source.contains("__aicore__"), "Add kernel 必须含 __aicore__");
-        assert!(out.source.contains("AscendC"), "Add kernel 必须含 AscendC 命名空间");
-        assert!(out.source.contains("neutron_add_0"), "Add kernel 必须含 neutron_add_0");
-        assert!(out.source.contains("AscendC::Add"), "Add kernel 必须调用 AscendC::Add");
+        assert!(
+            out.source.contains("__aicore__"),
+            "Add kernel 必须含 __aicore__"
+        );
+        assert!(
+            out.source.contains("AscendC"),
+            "Add kernel 必须含 AscendC 命名空间"
+        );
+        assert!(
+            out.source.contains("neutron_add_0"),
+            "Add kernel 必须含 neutron_add_0"
+        );
+        assert!(
+            out.source.contains("AscendC::Add"),
+            "Add kernel 必须调用 AscendC::Add"
+        );
         assert!(out.source.contains("TILE_LENGTH"));
         assert!(out.source.contains("BUFFER_NUM"));
         assert_eq!(out.kernels.len(), 1);
@@ -1470,7 +1492,9 @@ mod tests {
         let specs = vec![make_spec(OpKind::MatMul, 4)];
         let out = emit(&specs, GpuArch::Ascend910B1).expect("emit 失败");
         assert!(
-            out.source.contains("MatMul") || out.source.contains("mmad") || out.source.contains("Cube"),
+            out.source.contains("MatMul")
+                || out.source.contains("mmad")
+                || out.source.contains("Cube"),
             "910B1 MatMul 必须含 MatMul/mmad/Cube"
         );
         assert!(out.source.contains("Ascend 910B1"));
@@ -1493,7 +1517,10 @@ mod tests {
     fn test_emit_softmax() {
         let specs = vec![make_spec(OpKind::Softmax, 5)];
         let out = emit(&specs, GpuArch::Ascend910B1).expect("emit 失败");
-        assert!(out.source.contains("ReduceMax"), "softmax 必须含 ReduceMax（数值稳定）");
+        assert!(
+            out.source.contains("ReduceMax"),
+            "softmax 必须含 ReduceMax（数值稳定）"
+        );
         assert!(out.source.contains("Exp"), "softmax 必须含 Exp");
         assert!(out.source.contains("ReduceSum"), "softmax 必须含 ReduceSum");
         assert!(out.source.contains("Div"), "softmax 必须含 Div");
@@ -1505,7 +1532,9 @@ mod tests {
         let specs = vec![make_spec(OpKind::LayerNorm, 6)];
         let out = emit(&specs, GpuArch::Ascend910B1).expect("emit 失败");
         assert!(
-            out.source.contains("ReduceMean") || out.source.contains("ReduceSum") || out.source.contains("epsilon"),
+            out.source.contains("ReduceMean")
+                || out.source.contains("ReduceSum")
+                || out.source.contains("epsilon"),
             "layernorm 应含 ReduceMean/ReduceSum/epsilon"
         );
         assert!(out.source.contains("epsilon"));
