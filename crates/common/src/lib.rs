@@ -2,6 +2,7 @@
 
 use base::Graph;
 use std::cell::Cell;
+use std::fmt;
 
 /// 优化的目标后端
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -10,6 +11,18 @@ pub enum Target {
     Cuda,
     Npu,
     Cpu,
+}
+
+impl fmt::Display for Target {
+    /// 稳定的字符串表示，对外暴露给 `Output.target` 字段。
+    /// 不依赖 `Debug` 派生（`Debug` 输出会随字段/变体演化而变）。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Target::Cuda => "cuda",
+            Target::Npu => "npu",
+            Target::Cpu => "cpu",
+        })
+    }
 }
 
 /// 优化等级

@@ -1,4 +1,4 @@
-//! cuda emit — stub（由子代理填充）
+//! cuda emit — 委托 `crate::cuda::kernels::generate` 生成 CUDA C++ 源码
 
 use crate::spec::*;
 use base::Result;

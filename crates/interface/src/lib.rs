@@ -102,10 +102,11 @@ pub fn compile(input: Input, config: Config) -> Result<Output> {
 
     // 6. 后端代码生成（CUDA/Triton/Metal/CANN）
     // 按 target 选默认微架构：Cuda→Hopper90（服务器常见），Npu→Ascend910B1
+    // CPU 后端本轮未实现，source_lang 标记为 Cpu（不再误用 Cuda）
     let (arch, source_lang) = match config.target {
         common::Target::Cuda => (backend::GpuArch::Hopper90, backend::SourceLang::Cuda),
         common::Target::Npu => (backend::GpuArch::Ascend910B1, backend::SourceLang::Cann),
-        common::Target::Cpu => (backend::GpuArch::Ampere80, backend::SourceLang::Cuda),
+        common::Target::Cpu => (backend::GpuArch::Ampere80, backend::SourceLang::Cpu),
     };
     let backend_out = backend::emit(&graph, &allocation.instructions, config.target, arch)?;
     let backend_source = if backend_out.source.is_empty() {
@@ -123,7 +124,7 @@ pub fn compile(input: Input, config: Config) -> Result<Output> {
     };
 
     Ok(Output {
-        target: format!("{:?}", config.target).to_lowercase(),
+        target: config.target.to_string(),
         instructions,
         machine_instructions: allocation.instructions,
         reg_assignment: allocation.vreg_to_preg,
@@ -264,6 +265,31 @@ mod tests {
         assert_eq!(out.target, "cuda");
         // backend_lang 应被设置
         assert!(out.backend_lang.is_some());
+    }
+
+    /// CPU target 不应误报为 CUDA：backend_lang 必须标 "CPU C (not implemented)"，
+    /// backend_source 含 "not implemented" 提示。回归 test for [H4] 修复。
+    #[test]
+    fn cpu_target_does_not_pretend_cuda() {
+        let cfg = Config {
+            target: Target::Cpu,
+            opt_level: OptLevel::O2,
+            dump_ir: false,
+            ..Default::default()
+        };
+        let out = compile(Input::Onnx(vec![]), cfg).unwrap();
+        assert_eq!(out.target, "cpu");
+        let lang = out.backend_lang.expect("backend_lang 应被设置");
+        assert!(
+            lang.contains("CPU") && !lang.contains("CUDA"),
+            "CPU target 不应误报为 CUDA，实际: {lang}"
+        );
+        if let Some(src) = &out.backend_source {
+            assert!(
+                src.contains("not implemented"),
+                "CPU backend 源码应含 not implemented 提示，实际: {src}"
+            );
+        }
     }
 
     // --- 端到端：frontend ONNX 属性 → decompose ---

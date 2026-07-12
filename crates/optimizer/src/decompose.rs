@@ -424,7 +424,9 @@ fn rewrite_value_uses(graph: &mut Graph, old_values: &[ValueId], new_v: ValueId)
     let is_old = |v: ValueId| old_values.contains(&v);
     let node_ids: Vec<u32> = graph.node_ids().collect();
     for nid in node_ids {
-        let Ok(node) = graph.node(nid) else { continue; };
+        let Ok(node) = graph.node(nid) else {
+            continue;
+        };
         let old_inputs: Vec<ValueId> = node.inputs().to_vec();
         let changed = old_inputs.iter().any(|&v| is_old(v));
         if changed {

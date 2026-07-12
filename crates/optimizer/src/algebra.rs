@@ -428,7 +428,9 @@ fn rewrite_inputs(graph: &mut Graph, replacements: &HashMap<ValueId, ValueId>) {
     let lookup = |v: ValueId| -> ValueId { replacements.get(&v).copied().unwrap_or(v) };
     let node_ids: Vec<u32> = graph.node_ids().collect();
     for nid in node_ids {
-        let Ok(node) = graph.node(nid) else { continue; };
+        let Ok(node) = graph.node(nid) else {
+            continue;
+        };
         let old_inputs: Vec<ValueId> = node.inputs().to_vec();
         let new_inputs: Vec<ValueId> = old_inputs.iter().map(|&v| lookup(v)).collect();
         if old_inputs != new_inputs {

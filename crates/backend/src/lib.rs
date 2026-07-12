@@ -42,7 +42,7 @@ pub fn emit(
             // 但不能 panic，返回空输出
             Ok(BackendOutput {
                 source: "// CPU backend not implemented in this round\n".to_string(),
-                lang: SourceLang::Cuda,
+                lang: SourceLang::Cpu,
                 kernels: vec![],
                 arch,
             })
@@ -58,5 +58,11 @@ pub fn emit_for(graph: &Graph, lang: SourceLang, arch: GpuArch) -> base::Result<
         SourceLang::Triton => triton::emit(&kernels, arch),
         SourceLang::Metal => metal::emit(&kernels, arch),
         SourceLang::Cann => cann::emit(&kernels, arch),
+        SourceLang::Cpu => Ok(BackendOutput {
+            source: "// CPU backend not implemented in this round\n".to_string(),
+            lang: SourceLang::Cpu,
+            kernels: vec![],
+            arch,
+        }),
     }
 }

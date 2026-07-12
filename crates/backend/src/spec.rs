@@ -389,6 +389,7 @@ pub enum SourceLang {
     Triton, // .py
     Metal,  // .metal (MSL)
     Cann,   // .cpp
+    Cpu,    // .c (本轮未实现，仅占位)
 }
 
 impl SourceLang {
@@ -398,6 +399,7 @@ impl SourceLang {
             SourceLang::Triton => "py",
             SourceLang::Metal => "metal",
             SourceLang::Cann => "cpp",
+            SourceLang::Cpu => "c",
         }
     }
     pub fn name(self) -> &'static str {
@@ -406,6 +408,7 @@ impl SourceLang {
             SourceLang::Triton => "Triton (Python)",
             SourceLang::Metal => "Metal Shading Language",
             SourceLang::Cann => "Ascend CANN C++",
+            SourceLang::Cpu => "CPU C (not implemented)",
         }
     }
 }
