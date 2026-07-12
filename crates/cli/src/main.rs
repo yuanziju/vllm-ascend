@@ -4,14 +4,40 @@ use std::env;
 use std::fs;
 use std::process;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn print_usage() {
+    eprintln!("neutron v{} — ONNX → GPU/NPU kernel 编译器", VERSION);
+    eprintln!();
+    eprintln!("用法: neutron <input.onnx> [--target cuda|npu|cpu] [--opt 0|1|2|3] [--dump] [--help] [--version]");
+    eprintln!();
+    eprintln!("选项:");
+    eprintln!("  --target <t>   目标后端: cuda (NVIDIA), npu (昇腾), cpu (回退)");
+    eprintln!("  --opt <n>      优化等级: 0=关闭, 1=基础, 2=默认, 3=激进");
+    eprintln!("  --dump         输出 IR 调试信息到 stderr");
+    eprintln!("  --help, -h     显示帮助");
+    eprintln!("  --version, -V  显示版本号");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("用法: neutron <input.onnx> [--target cuda|npu|cpu] [--opt 0|1|2|3] [--dump]");
+        print_usage();
         process::exit(1);
     }
 
     let input_path = &args[1];
+
+    // flags
+    if input_path == "--help" || input_path == "-h" {
+        print_usage();
+        process::exit(0);
+    }
+    if input_path == "--version" || input_path == "-V" {
+        println!("neutron {}", VERSION);
+        process::exit(0);
+    }
+
     let mut target = common::Target::Cuda;
     let mut opt_level = common::OptLevel::O2;
     let mut dump_ir = false;
@@ -27,7 +53,7 @@ fn main() {
                         "npu" => common::Target::Npu,
                         "cpu" => common::Target::Cpu,
                         _ => {
-                            eprintln!("未知 target: {}", args[i]);
+                            eprintln!("未知 target: {} (可选: cuda, npu, cpu)", args[i]);
                             process::exit(1);
                         }
                     };
@@ -42,7 +68,7 @@ fn main() {
                         "2" => common::OptLevel::O2,
                         "3" => common::OptLevel::O3,
                         _ => {
-                            eprintln!("未知 opt level: {}", args[i]);
+                            eprintln!("未知 opt level: {} (可选: 0, 1, 2, 3)", args[i]);
                             process::exit(1);
                         }
                     };
@@ -51,8 +77,17 @@ fn main() {
             "--dump" => {
                 dump_ir = true;
             }
+            "--help" | "-h" => {
+                print_usage();
+                process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("neutron {}", VERSION);
+                process::exit(0);
+            }
             _ => {
                 eprintln!("未知参数: {}", args[i]);
+                eprintln!("运行 neutron --help 查看用法");
                 process::exit(1);
             }
         }
@@ -75,10 +110,13 @@ fn main() {
     match interface::compile(interface::Input::Onnx(bytes), config) {
         Ok(out) => {
             if let Some(debug) = &out.debug {
-                println!("{}", debug);
+                eprintln!("{}", debug);
             }
-            println!("target: {}", out.target);
-            println!("instructions: {}", out.instructions.len());
+            if let Some(src) = &out.backend_source {
+                println!("{}", src);
+            }
+            eprintln!("target: {}", out.target);
+            eprintln!("instructions: {}", out.instructions.len());
         }
         Err(e) => {
             eprintln!("编译失败: {}", e);
