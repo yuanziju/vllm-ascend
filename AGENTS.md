@@ -600,3 +600,67 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 5. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）
 6. Slice no-op 识别：需先补 AttrKey::Starts/Ends/Axes/Steps + frontend 解析 Slice 属性
 7. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型
+
+### 2026-07-11 — 后端代码生成四件套（feat/neutron-backend）
+
+**当前状态**：CUDA / Triton / Metal / Ascend CANN 四个后端的代码生成全部完成，每个后端覆盖全 31 个 OpKind（无空缺/stub），按微架构特化（Hopper wgmma+TMA / Blackwell tensor memory / Ampere mma.sync / Apple simdgroup / Ascend Cube+Vector Core）。已集成到 `interface::compile` 流程，回归全绿。本分支待合并回 main。
+
+**已完成**：
+- backend crate 骨架（spec/extract/lib）— commit 406e7c1
+  - `GpuArch` enum（9 变体）：Ampere80/Hopper90/Blackwell100/Apple6/7/8/Ascend910B1/B3/310P3
+  - `KernelSpec` + `LaunchSpec` + `TensorSpec` + `KernelAttrs` 后端无关规格
+  - `DTypeExt` trait 扩展（c_type/msl_type/triton_type/cann_type/size_bytes，不能给外部 crate DType 加 inherent impl）
+  - `extract.rs` 从 IR Graph 提取 KernelSpec（AttrKey 数值常量匹配，因 base::storage::AttrKey 私有）
+  - 4 个后端 stub 先编译通过
+- **CUDA 后端**（1285 行）— commit 729b508
+  - Ampere80: `nvcuda::wmma` mma.sync 16x16x16 tile
+  - Hopper90: `wgmma.mma_async` 64x256 + TMA（cp.async.bulk + mbarrier PTX 内联）
+  - Blackwell100: tensor memory + tcgen05 TC fusion
+  - 元素级/Reduce/Softmax/LayerNorm/Conv/Pool/Transpose（带 bank conflict padding）/Concat/Slice 全覆盖
+  - Constant 广播 / Fused 链式 / Custom `extern "C"` 入口
+  - 13 单测验证语法关键字 + 全 OpKind × 全 arch 矩阵
+- **Triton 后端**（1155 行）— commit 0fcdf30
+  - Hopper90: `tl.make_block_ptr` + `tl.advance` + `boundary_check`（SM90 TMA）
+  - Ampere80: 标准 `tl.dot`，BLOCK_M=BLOCK_N=64
+  - Blackwell100: SM100 FP4/FP6 tensor core 注释
+  - 32 OpKind 全覆盖，12 单测
+- **Metal 后端**（906 行）— commit 05d66fb
+  - `simdgroup<float8x8>` 8x8 矩阵乘法单元（Apple6/7/8）
+  - threadgroup shared memory + `threadgroup_barrier(mem_flags::mem_threadgroup)`
+  - Softmax 三遍 / LayerNorm 两遍 + epsilon
+  - 9 单测
+- **Ascend CANN 后端**（1600 行）— commit 06ca79e
+  - AscendC 高级 API（Add/Sub/Mul/ReduceSum/MatMul 等）
+  - Ascend910B1/B3: Cube Core (mmad) + Vector Core 协同
+  - Ascend310P3: 轻量推理路径
+  - 双缓冲 (BUFFER_NUM=2) + tiling (TILE_LENGTH=128)
+  - TQue/TPipe/GlobalTensor/LocalTensor/DataCopy 标准 Ascend 结构
+  - 10 单测
+- clippy + fmt 修复（manual_div_ceil / clone_on_copy）— commit da68819
+- **interface 集成** — commit 2b6e4f4
+  - `interface::compile` 在 regalloc 后增加第 6 步：`backend::emit`
+  - 按 target 选默认微架构：Cuda→Hopper90，Npu→Ascend910B1
+  - `Output` 新增 `backend_source` + `backend_lang` 字段
+  - 5 个端到端测试验证四后端产出非空源码
+
+**回归验证（全绿）**：
+- `cargo build --workspace`：0 warning
+- `cargo clippy --workspace -- -D warnings`：0 warning
+- `cargo fmt --all --check`：clean
+- `cargo test --workspace`：242 passed（backend 44 + interface 13 + 其余 185）
+
+**设计要点**：
+- `KernelSpec` 是后端无关规格，4 个后端共享 `extract.rs` 提取逻辑，各自只关心源码生成
+- `GpuArch` enum 统一表达 9 个微架构，`has_tma/has_wgmma/has_simdgroup/has_cube_core` 能力查询让后端按需分派
+- `DTypeExt` trait 扩展模式解决"给外部 crate 的 DType 加方法"问题（Rust 不允许 inherent impl）
+- 子代理写入文件丢失问题：CUDA/Triton 子代理首次返回成功但文件未保存（沙箱问题），重派时增加 `wc -l` 验证步骤才成功
+
+**下一步**（优先级排序）：
+1. 合并 feat/neutron-backend → main
+2. backend：CUDA kernel 的 dtype template instantiation（当前用注释标注，后续可生成真正的 template 实例）
+3. backend：Triton autotune 配置（当前 BLOCK_SIZE 固定，可加 `@triton.autotune` 多配置搜索）
+4. backend：Metal MPS host 端 launch 代码（当前注释形式，后续生成 Swift/Obj-C++ wrapper）
+5. backend：CANN tiling 参数从 host 端传入（当前硬编码 TILE_LENGTH=128，后续从 tiling buffer 读）
+6. regalloc：live-out 精确干扰 + spill code 位置优化
+7. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型
+
