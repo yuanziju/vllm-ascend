@@ -14,3 +14,4 @@ optimizer = { workspace = true }
 arch = { workspace = true }
 isel = { workspace = true }
 regalloc = { workspace = true }
+backend = { workspace = true }

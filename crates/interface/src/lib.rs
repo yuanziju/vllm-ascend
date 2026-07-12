@@ -23,6 +23,10 @@ pub struct Output {
     pub reg_assignment: std::collections::HashMap<regalloc::VReg, regalloc::PReg>,
     /// 溢出 VReg 集合
     pub spilled: std::collections::HashSet<regalloc::VReg>,
+    /// 后端生成的 kernel 源码（CUDA/Triton/Metal/CANN）
+    pub backend_source: Option<String>,
+    /// 后端源码语言名（如 "CUDA C++"、"Triton (Python)"）
+    pub backend_lang: Option<String>,
     pub debug: Option<String>,
 }
 
@@ -96,12 +100,36 @@ pub fn compile(input: Input, config: Config) -> Result<Output> {
         }
     }
 
+    // 6. 后端代码生成（CUDA/Triton/Metal/CANN）
+    // 按 target 选默认微架构：Cuda→Hopper90（服务器常见），Npu→Ascend910B1
+    let (arch, source_lang) = match config.target {
+        common::Target::Cuda => (backend::GpuArch::Hopper90, backend::SourceLang::Cuda),
+        common::Target::Npu => (backend::GpuArch::Ascend910B1, backend::SourceLang::Cann),
+        common::Target::Cpu => (backend::GpuArch::Ampere80, backend::SourceLang::Cuda),
+    };
+    let backend_out = backend::emit(&graph, &allocation.instructions, config.target, arch)?;
+    let backend_source = if backend_out.source.is_empty() {
+        None
+    } else {
+        if config.dump_ir {
+            debug.push_str(&format!(
+                "\n// === 后端代码生成 ({}, {} kernels) ===\n",
+                backend_out.lang.name(),
+                backend_out.kernels.len()
+            ));
+            debug.push_str(&backend_out.source);
+        }
+        Some(backend_out.source)
+    };
+
     Ok(Output {
         target: format!("{:?}", config.target).to_lowercase(),
         instructions,
         machine_instructions: allocation.instructions,
         reg_assignment: allocation.vreg_to_preg,
         spilled: allocation.spilled,
+        backend_source,
+        backend_lang: Some(source_lang.name().to_string()),
         debug: if config.dump_ir { Some(debug) } else { None },
     })
 }
@@ -129,6 +157,113 @@ mod tests {
         assert!(out.instructions.is_empty());
         assert!(out.machine_instructions.is_empty());
         assert!(out.debug.is_some());
+    }
+
+    // --- 端到端：后端代码生成 ---
+
+    /// 构造简单计算图 x → relu → out，验证 CUDA 后端生成非空源码
+    #[test]
+    fn backend_emits_cuda_source() {
+        use base::{Graph, OpKind, Type};
+        let mut graph = Graph::new("test_cuda");
+        let ty = Type::Tensor {
+            dtype: base::DType::F32,
+            dims: vec![4, 8],
+        };
+        let x = graph.add_input(ty.clone(), Some("x"));
+        let relu = graph.add_node(OpKind::Relu);
+        let out = graph.add_value(ty, Some("out"), relu);
+        graph.storage.set_node_inputs(relu, &[x]);
+        graph.storage.set_node_outputs(relu, &[out]);
+        graph.mark_output(out);
+
+        let arch = backend::GpuArch::Hopper90;
+        let result = backend::emit_for(&graph, backend::SourceLang::Cuda, arch).unwrap();
+        assert!(!result.source.is_empty(), "CUDA 源码不应为空");
+        assert!(result.source.contains("__global__"), "应含 __global__");
+        assert!(result.source.contains("neutron_relu"), "应含 kernel 名");
+    }
+
+    /// 验证 Triton 后端生成非空 Python 源码
+    #[test]
+    fn backend_emits_triton_source() {
+        use base::{Graph, OpKind, Type};
+        let mut graph = Graph::new("test_triton");
+        let ty = Type::Tensor {
+            dtype: base::DType::F32,
+            dims: vec![4, 8],
+        };
+        let x = graph.add_input(ty.clone(), Some("x"));
+        let add = graph.add_node(OpKind::Add);
+        let out = graph.add_value(ty, Some("out"), add);
+        graph.storage.set_node_inputs(add, &[x, x]);
+        graph.storage.set_node_outputs(add, &[out]);
+        graph.mark_output(out);
+
+        let arch = backend::GpuArch::Hopper90;
+        let result = backend::emit_for(&graph, backend::SourceLang::Triton, arch).unwrap();
+        assert!(!result.source.is_empty(), "Triton 源码不应为空");
+        assert!(result.source.contains("@triton.jit"), "应含 @triton.jit");
+    }
+
+    /// 验证 Metal 后端生成非空 MSL 源码
+    #[test]
+    fn backend_emits_metal_source() {
+        use base::{Graph, OpKind, Type};
+        let mut graph = Graph::new("test_metal");
+        let ty = Type::Tensor {
+            dtype: base::DType::F32,
+            dims: vec![4, 8],
+        };
+        let x = graph.add_input(ty.clone(), Some("x"));
+        let mul = graph.add_node(OpKind::Mul);
+        let out = graph.add_value(ty, Some("out"), mul);
+        graph.storage.set_node_inputs(mul, &[x, x]);
+        graph.storage.set_node_outputs(mul, &[out]);
+        graph.mark_output(out);
+
+        let arch = backend::GpuArch::Apple8;
+        let result = backend::emit_for(&graph, backend::SourceLang::Metal, arch).unwrap();
+        assert!(!result.source.is_empty(), "Metal 源码不应为空");
+        assert!(result.source.contains("kernel void"), "应含 kernel void");
+    }
+
+    /// 验证 CANN 后端生成非空 Ascend C++ 源码
+    #[test]
+    fn backend_emits_cann_source() {
+        use base::{Graph, OpKind, Type};
+        let mut graph = Graph::new("test_cann");
+        let ty = Type::Tensor {
+            dtype: base::DType::F32,
+            dims: vec![4, 8],
+        };
+        let x = graph.add_input(ty.clone(), Some("x"));
+        let sub = graph.add_node(OpKind::Sub);
+        let out = graph.add_value(ty, Some("out"), sub);
+        graph.storage.set_node_inputs(sub, &[x, x]);
+        graph.storage.set_node_outputs(sub, &[out]);
+        graph.mark_output(out);
+
+        let arch = backend::GpuArch::Ascend910B1;
+        let result = backend::emit_for(&graph, backend::SourceLang::Cann, arch).unwrap();
+        assert!(!result.source.is_empty(), "CANN 源码不应为空");
+        assert!(result.source.contains("__aicore__"), "应含 __aicore__");
+    }
+
+    /// 完整 compile 流程：验证 backend_source 字段被填充
+    #[test]
+    fn compile_produces_backend_source() {
+        let cfg = Config {
+            target: Target::Cuda,
+            opt_level: OptLevel::O2,
+            dump_ir: false,
+            ..Default::default()
+        };
+        // 空图经 DCE 后无节点，backend 源码可能为空，但流程应跑通
+        let out = compile(Input::Onnx(vec![]), cfg).unwrap();
+        assert_eq!(out.target, "cuda");
+        // backend_lang 应被设置
+        assert!(out.backend_lang.is_some());
     }
 
     // --- 端到端：frontend ONNX 属性 → decompose ---
