@@ -459,3 +459,255 @@ impl StorageGraph {
         self.value_hdr[value as usize].def_node
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 验证 AttrKey 全部变体都能从 u8 往返（防止新增变体漏 from_u8 分支）
+    #[test]
+    fn attr_key_roundtrip_all_variants() {
+        let all = [
+            AttrKey::Strides,
+            AttrKey::Padding,
+            AttrKey::Dilation,
+            AttrKey::Groups,
+            AttrKey::Axis,
+            AttrKey::Alpha,
+            AttrKey::Beta,
+            AttrKey::TransposeA,
+            AttrKey::TransposeB,
+            AttrKey::Epsilon,
+            AttrKey::Shape,
+            AttrKey::Value,
+            AttrKey::Perm,
+            AttrKey::Custom,
+        ];
+        for k in all {
+            let v = k as u8;
+            let back = AttrKey::from_u8(v).expect("from_u8 应返回 Some");
+            assert_eq!(
+                back, k,
+                "AttrKey 往返失败: {} -> {} -> {:?}",
+                k as u8, v, back
+            );
+        }
+    }
+
+    /// AttrKey::from_u8 对未知值应返回 None
+    #[test]
+    fn attr_key_from_u8_unknown_returns_none() {
+        assert!(AttrKey::from_u8(13).is_none());
+        assert!(AttrKey::from_u8(100).is_none());
+        assert!(AttrKey::from_u8(254).is_none());
+    }
+
+    /// AttrTag 全部变体往返
+    #[test]
+    fn attr_tag_roundtrip_all_variants() {
+        for tag in [
+            AttrTag::Int,
+            AttrTag::Float,
+            AttrTag::Bool,
+            AttrTag::IntArray,
+            AttrTag::FloatArray,
+        ] {
+            let v = tag as u8;
+            let back = AttrTag::from_u8(v).expect("AttrTag::from_u8 应返回 Some");
+            assert_eq!(back as u8, v);
+        }
+    }
+
+    /// 基础节点+值分配：alloc_node/alloc_value 返回递增 ID
+    #[test]
+    fn alloc_node_value_increasing_ids() {
+        let mut g = StorageGraph::new();
+        let n0 = g.alloc_node(1);
+        let n1 = g.alloc_node(2);
+        let v0 = g.alloc_value(0, 0, 0, u32::MAX, n0);
+        let v1 = g.alloc_value(0, 0, 0, u32::MAX, n1);
+        assert_eq!(n0, 0);
+        assert_eq!(n1, 1);
+        assert_eq!(v0, 0);
+        assert_eq!(v1, 1);
+        assert_eq!(g.node_count(), 2);
+        assert_eq!(g.value_count(), 2);
+    }
+
+    /// set_node_inputs / outputs 读写一致性
+    #[test]
+    fn set_and_read_node_inputs_outputs() {
+        let mut g = StorageGraph::new();
+        let n = g.alloc_node(1);
+        let v0 = g.alloc_value(0, 0, 0, u32::MAX, n);
+        let v1 = g.alloc_value(0, 0, 0, u32::MAX, n);
+        let v2 = g.alloc_value(0, 0, 0, u32::MAX, n);
+
+        g.set_node_inputs(n, &[v0, v1]);
+        g.set_node_outputs(n, &[v2]);
+
+        assert_eq!(g.node_inputs(n), &[v0, v1]);
+        assert_eq!(g.node_outputs(n), &[v2]);
+    }
+
+    /// 多节点 inputs/outputs 共享 edges 池，offset/len 正确隔离
+    #[test]
+    fn multiple_nodes_share_edges_pool() {
+        let mut g = StorageGraph::new();
+        let n0 = g.alloc_node(1);
+        let n1 = g.alloc_node(2);
+        let v0 = g.alloc_value(0, 0, 0, u32::MAX, n0);
+        let v1 = g.alloc_value(0, 0, 0, u32::MAX, n1);
+
+        g.set_node_inputs(n0, &[v0, v0]);
+        g.set_node_inputs(n1, &[v1]);
+
+        // n0 inputs 仍是 [v0, v0]，没被 n1 的输入覆盖
+        assert_eq!(g.node_inputs(n0), &[v0, v0]);
+        assert_eq!(g.node_inputs(n1), &[v1]);
+    }
+
+    /// 属性读写往返：Int / Float / Bool / IntArray / FloatArray
+    #[test]
+    fn attr_int_roundtrip() {
+        let mut g = StorageGraph::new();
+        let n = g.alloc_node(1);
+        g.add_attr_int(n, AttrKey::Axis, 42);
+        g.add_attr_int(n, AttrKey::Groups, 1);
+
+        let attrs = g.node_attrs(n);
+        assert_eq!(attrs.len(), 2);
+
+        let axis_val = g.attr_int(&attrs[0]);
+        let groups_val = g.attr_int(&attrs[1]);
+        assert_eq!(axis_val, 42);
+        assert_eq!(groups_val, 1);
+    }
+
+    #[test]
+    fn attr_float_roundtrip() {
+        let mut g = StorageGraph::new();
+        let n = g.alloc_node(1);
+        g.add_attr_float(n, AttrKey::Epsilon, 1e-5);
+        g.add_attr_float(n, AttrKey::Value, 42.625);
+
+        let attrs = g.node_attrs(n);
+        assert_eq!(attrs.len(), 2);
+        assert!((g.attr_float(&attrs[0]) - 1e-5).abs() < 1e-12);
+        assert!((g.attr_float(&attrs[1]) - 42.625).abs() < 1e-12);
+    }
+
+    #[test]
+    fn attr_bool_roundtrip() {
+        let mut g = StorageGraph::new();
+        let n = g.alloc_node(1);
+        g.add_attr_bool(n, AttrKey::TransposeA, true);
+        g.add_attr_bool(n, AttrKey::TransposeB, false);
+
+        let attrs = g.node_attrs(n);
+        assert!(g.attr_bool(&attrs[0]));
+        assert!(!g.attr_bool(&attrs[1]));
+    }
+
+    #[test]
+    fn attr_int_array_roundtrip() {
+        let mut g = StorageGraph::new();
+        let n = g.alloc_node(1);
+        let vals = vec![1i64, 2, 3, -4, 100];
+        g.add_attr_int_array(n, AttrKey::Perm, &vals);
+
+        let attrs = g.node_attrs(n);
+        assert_eq!(attrs.len(), 1);
+        let read = g.attr_int_array(&attrs[0]);
+        assert_eq!(read, &vals[..]);
+    }
+
+    #[test]
+    fn attr_float_array_roundtrip() {
+        let mut g = StorageGraph::new();
+        let n = g.alloc_node(1);
+        let vals = vec![1.5f64, 2.5, -0.5, 100.0];
+        g.add_attr_float_array(n, AttrKey::Value, &vals);
+
+        let attrs = g.node_attrs(n);
+        assert_eq!(attrs.len(), 1);
+        let read = g.attr_float_array(&attrs[0]);
+        assert_eq!(read.len(), vals.len());
+        for (a, b) in read.iter().zip(vals.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    /// value shape + name 完整往返
+    #[test]
+    fn value_shape_and_name_roundtrip() {
+        let mut g = StorageGraph::new();
+        let n = g.alloc_node(1);
+        let shape_off = g.add_shape(&[16, 3, 64, 64]);
+        let name_off = g.add_name(Some("input_tensor"));
+        let v = g.alloc_value(0, 4, shape_off, name_off, n);
+
+        let shape = g.value_shape(v);
+        assert_eq!(shape, &[16, 3, 64, 64]);
+
+        let name = g.value_name(v);
+        assert_eq!(name, Some("input_tensor"));
+    }
+
+    /// value_name(None) 应返回 None（name_off = u32::MAX）
+    #[test]
+    fn value_name_none_returns_none() {
+        let mut g = StorageGraph::new();
+        let n = g.alloc_node(1);
+        let off = g.add_name(None);
+        assert_eq!(off, u32::MAX);
+        let v = g.alloc_value(0, 0, 0, u32::MAX, n);
+        assert_eq!(g.value_name(v), None);
+    }
+
+    /// set_value_shape 应覆盖原有 shape（rank + shape_off）
+    #[test]
+    fn set_value_shape_updates_rank_and_offset() {
+        let mut g = StorageGraph::new();
+        let n = g.alloc_node(1);
+        let shape_off = g.add_shape(&[4, 5]);
+        let v = g.alloc_value(0, 2, shape_off, u32::MAX, n);
+        assert_eq!(g.value_shape(v), &[4, 5]);
+
+        // 推断后改成 3 维
+        g.set_value_shape(v, &[2, 3, 4]);
+        assert_eq!(g.value_shape(v), &[2, 3, 4]);
+    }
+
+    /// value_def 返回定义该 value 的节点 ID
+    #[test]
+    fn value_def_returns_defining_node() {
+        let mut g = StorageGraph::new();
+        let n0 = g.alloc_node(1);
+        let n1 = g.alloc_node(2);
+        let v0 = g.alloc_value(0, 0, 0, u32::MAX, n0);
+        let v1 = g.alloc_value(0, 0, 0, u32::MAX, n1);
+        assert_eq!(g.value_def(v0), n0);
+        assert_eq!(g.value_def(v1), n1);
+    }
+
+    /// 新建节点的 parent_region 默认 u32::MAX（无父区域）
+    #[test]
+    fn new_node_parent_region_is_max() {
+        let mut g = StorageGraph::new();
+        let n = g.alloc_node(1);
+        assert_eq!(g.node_hdr[n as usize].parent_region, u32::MAX);
+    }
+
+    /// add_name 多次调用：每次以 \0 结尾，name_data 累积
+    #[test]
+    fn add_name_appends_null_terminated() {
+        let mut g = StorageGraph::new();
+        let off1 = g.add_name(Some("foo"));
+        let off2 = g.add_name(Some("bar"));
+        // name_data 应为 "foo\0bar\0"
+        assert_eq!(&g.name_data, b"foo\0bar\0");
+        assert_eq!(off1, 0);
+        assert_eq!(off2, 4);
+    }
+}
