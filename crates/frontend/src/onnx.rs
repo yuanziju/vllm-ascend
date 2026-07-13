@@ -1198,4 +1198,225 @@ mod tests {
         // 且 constant_value 应为 1.0
         assert_eq!(g.node(def).unwrap().constant_value(), Some(1.0));
     }
+
+    // ---- map_op_type 特殊映射（别名/归并，之前只测 6 个）----
+    #[test]
+    fn map_op_type_aliases_and_pools() {
+        // Gemm ≈ MatMul
+        assert_eq!(map_op_type("Gemm"), OpKind::MatMul);
+        // InstanceNormalization → LayerNorm
+        assert_eq!(map_op_type("InstanceNormalization"), OpKind::LayerNorm);
+        // 三种 Pool 都映射到 Pool
+        assert_eq!(map_op_type("MaxPool"), OpKind::Pool);
+        assert_eq!(map_op_type("AveragePool"), OpKind::Pool);
+        assert_eq!(map_op_type("GlobalAveragePool"), OpKind::Pool);
+        // ReduceL1/L2 → ReduceSum
+        assert_eq!(map_op_type("ReduceL1"), OpKind::ReduceSum);
+        assert_eq!(map_op_type("ReduceL2"), OpKind::ReduceSum);
+    }
+
+    #[test]
+    fn map_op_type_all_elementary_and_unary() {
+        // 二元
+        assert_eq!(map_op_type("Sub"), OpKind::Sub);
+        assert_eq!(map_op_type("Mul"), OpKind::Mul);
+        assert_eq!(map_op_type("Div"), OpKind::Div);
+        assert_eq!(map_op_type("Pow"), OpKind::Pow);
+        // 一元
+        assert_eq!(map_op_type("Relu"), OpKind::Relu);
+        assert_eq!(map_op_type("Gelu"), OpKind::Gelu);
+        assert_eq!(map_op_type("Sigmoid"), OpKind::Sigmoid);
+        assert_eq!(map_op_type("Tanh"), OpKind::Tanh);
+        assert_eq!(map_op_type("Sqrt"), OpKind::Sqrt);
+        assert_eq!(map_op_type("Exp"), OpKind::Exp);
+        assert_eq!(map_op_type("Log"), OpKind::Log);
+        assert_eq!(map_op_type("Abs"), OpKind::Abs);
+        assert_eq!(map_op_type("Reciprocal"), OpKind::Reciprocal);
+        // 其他
+        assert_eq!(map_op_type("Conv"), OpKind::Conv);
+        assert_eq!(map_op_type("Reshape"), OpKind::Reshape);
+        assert_eq!(map_op_type("Transpose"), OpKind::Transpose);
+        assert_eq!(map_op_type("Concat"), OpKind::Concat);
+        assert_eq!(map_op_type("Slice"), OpKind::Slice);
+        assert_eq!(map_op_type("ReduceMax"), OpKind::ReduceMax);
+        assert_eq!(map_op_type("ReduceSum"), OpKind::ReduceSum);
+    }
+
+    // ---- Reshape shape 属性（apply_attributes 第 5 个分支，之前未测）----
+    fn read_shape_attr(g: &Graph, nid: base::NodeId) -> Option<Vec<i64>> {
+        for e in g.node(nid).ok()?.attrs() {
+            if e.key == base::StorageAttrKey::Shape as u8
+                && e.tag == base::storage::AttrTag::IntArray as u8
+            {
+                return Some(g.node(nid).unwrap().storage.attr_int_array(e).to_vec());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn parses_reshape_shape_attribute() {
+        let attr = build_attr_ints("shape", &[2, 3, 4]);
+        let node = build_node_with_attrs("Reshape", &["x"], &["y"], &[attr]);
+        let graph = {
+            let mut g = Vec::new();
+            write_len_field(&mut g, 1, &node);
+            g
+        };
+        let mut buf = Vec::new();
+        write_len_field(&mut buf, 7, &graph);
+        let g = parse(&buf).unwrap();
+        let rs: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Reshape)
+            .collect();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(
+            read_shape_attr(&g, rs[0]),
+            Some(vec![2, 3, 4]),
+            "Reshape shape=[2,3,4] 应映射到 AttrKey::Shape"
+        );
+    }
+
+    // ---- reduce "axes" 多元素（取首元素）----
+    #[test]
+    fn parses_reduce_axes_takes_first() {
+        let attr = build_attr_ints("axes", &[1, 2, 3]);
+        let node = build_node_with_attrs("ReduceSum", &["x"], &["y"], &[attr]);
+        let graph = {
+            let mut g = Vec::new();
+            write_len_field(&mut g, 1, &node);
+            g
+        };
+        let mut buf = Vec::new();
+        write_len_field(&mut buf, 7, &graph);
+        let g = parse(&buf).unwrap();
+        let rs: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::ReduceSum)
+            .collect();
+        assert_eq!(rs.len(), 1);
+        // axes=[1,2,3] 取首元素 1
+        assert_eq!(read_axis_attr(&g, rs[0]), Some(1), "axes 多元素应取首元素");
+    }
+
+    // ---- 多节点数据流链 A→B→C ----
+    #[test]
+    fn multi_node_chain_dataflow() {
+        // x → Relu → t → Sqrt → y
+        let n1 = {
+            let mut n = Vec::new();
+            write_string_field(&mut n, 1, "x");
+            write_string_field(&mut n, 2, "t");
+            write_string_field(&mut n, 3, "Relu");
+            n
+        };
+        let n2 = {
+            let mut n = Vec::new();
+            write_string_field(&mut n, 1, "t");
+            write_string_field(&mut n, 2, "y");
+            write_string_field(&mut n, 3, "Sqrt");
+            n
+        };
+        let graph = {
+            let mut g = Vec::new();
+            write_len_field(&mut g, 1, &n1);
+            write_len_field(&mut g, 1, &n2);
+            g
+        };
+        let mut buf = Vec::new();
+        write_len_field(&mut buf, 7, &graph);
+        let g = parse(&buf).unwrap();
+        assert_eq!(g.node_count(), 2);
+        let relu: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Relu)
+            .collect();
+        let sqrt: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Sqrt)
+            .collect();
+        assert_eq!(relu.len(), 1);
+        assert_eq!(sqrt.len(), 1);
+        // Sqrt 的 input 应是 Relu 的 output value（同一 ValueId）
+        let sqrt_inputs = g.node(sqrt[0]).unwrap().inputs();
+        let relu_outputs = g.node(relu[0]).unwrap().outputs();
+        assert!(!sqrt_inputs.is_empty(), "Sqrt 应有 input");
+        assert!(!relu_outputs.is_empty(), "Relu 应有 output");
+        assert_eq!(
+            sqrt_inputs[0], relu_outputs[0],
+            "Sqrt 的 input 应等于 Relu 的 output（数据流连接）"
+        );
+    }
+
+    // ---- 多 initializer → 多 Constant ----
+    #[test]
+    fn multiple_initializers_become_multiple_constants() {
+        let t1 = build_tensor_float_raw("w1", &[2], &[1.0f32, 2.0]);
+        let t2 = build_tensor_float_raw("w2", &[3], &[3.0f32, 4.0, 5.0]);
+        let graph = {
+            let mut g = Vec::new();
+            write_len_field(&mut g, 5, &t1);
+            write_len_field(&mut g, 5, &t2);
+            g
+        };
+        let mut buf = Vec::new();
+        write_len_field(&mut buf, 7, &graph);
+        let g = parse(&buf).unwrap();
+        let consts: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Constant)
+            .collect();
+        assert_eq!(consts.len(), 2, "2 个 initializer 应生成 2 个 Constant");
+    }
+
+    // ---- 二元 op 两图输入 ----
+    #[test]
+    fn binary_op_with_two_graph_inputs() {
+        // Add(x, y) → z，x 和 y 都是图输入
+        let node = {
+            let mut n = Vec::new();
+            write_string_field(&mut n, 1, "x");
+            write_string_field(&mut n, 1, "y");
+            write_string_field(&mut n, 2, "z");
+            write_string_field(&mut n, 3, "Add");
+            n
+        };
+        let vi_x = {
+            let mut v = Vec::new();
+            write_string_field(&mut v, 1, "x");
+            v
+        };
+        let vi_y = {
+            let mut v = Vec::new();
+            write_string_field(&mut v, 1, "y");
+            v
+        };
+        let vi_z = {
+            let mut v = Vec::new();
+            write_string_field(&mut v, 1, "z");
+            v
+        };
+        let graph = {
+            let mut g = Vec::new();
+            write_len_field(&mut g, 1, &node);
+            write_len_field(&mut g, 11, &vi_x);
+            write_len_field(&mut g, 11, &vi_y);
+            write_len_field(&mut g, 12, &vi_z);
+            g
+        };
+        let mut buf = Vec::new();
+        write_len_field(&mut buf, 7, &graph);
+        let g = parse(&buf).unwrap();
+        let adds: Vec<_> = g
+            .node_ids()
+            .filter(|&id| g.node(id).unwrap().kind == OpKind::Add)
+            .collect();
+        assert_eq!(adds.len(), 1);
+        let ins = g.node(adds[0]).unwrap().inputs();
+        assert_eq!(ins.len(), 2, "Add 应有 2 个 input");
+        assert_ne!(ins[0], u32::MAX, "input 0 应是有效 value");
+        assert_ne!(ins[1], u32::MAX, "input 1 应是有效 value");
+        assert_eq!(g.inputs().len(), 2, "图应有 2 个输入 x 和 y");
+    }
 }
