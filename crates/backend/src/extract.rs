@@ -162,3 +162,121 @@ fn op_short_name(op: OpKind) -> &'static str {
         OpKind::Custom => "custom",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base::{DType, Graph, Type};
+
+    /// 构造简单图：x → add(x,x) → out，验证 extract_kernels 能提取出
+    /// 节点的 KernelSpec（name、inputs、outputs、dtype 都正确）。
+    #[test]
+    fn extract_kernels_basic() {
+        let mut g = Graph::new("test");
+        let ty = Type::Tensor {
+            dtype: DType::F32,
+            dims: vec![2, 3],
+        };
+        let x = g.add_input(ty.clone(), Some("x"));
+        let add = g.add_node(OpKind::Add);
+        let out = g.add_value(ty, Some("out"), add);
+        g.storage.set_node_inputs(add, &[x, x]);
+        g.storage.set_node_outputs(add, &[out]);
+        g.mark_output(out);
+
+        let specs = extract_kernels(&g);
+        assert_eq!(specs.len(), 1, "应有 1 个 KernelSpec");
+        let spec = &specs[0];
+        assert_eq!(spec.op, OpKind::Add);
+        assert_eq!(spec.inputs.len(), 2, "Add 应有 2 个输入");
+        assert_eq!(spec.outputs.len(), 1, "Add 应有 1 个输出");
+        assert_eq!(spec.dtype, DType::F32);
+        assert!(spec.name.starts_with("neutron_add_"), "name 应为 neutron_add_*, 实际: {}", spec.name);
+    }
+
+    /// 空图应返回空 KernelSpec 列表，不 panic
+    #[test]
+    fn extract_kernels_empty_graph() {
+        let g = Graph::new("empty");
+        let specs = extract_kernels(&g);
+        assert!(specs.is_empty(), "空图应返回空 KernelSpec 列表");
+    }
+
+    /// 多节点图：每个计算节点都应有一个 KernelSpec
+    #[test]
+    fn extract_kernels_multi_node() {
+        let mut g = Graph::new("multi");
+        let ty = Type::Tensor {
+            dtype: DType::F32,
+            dims: vec![4, 8],
+        };
+        let x = g.add_input(ty.clone(), Some("x"));
+        let relu = g.add_node(OpKind::Relu);
+        let r_out = g.add_value(ty.clone(), Some("r"), relu);
+        g.storage.set_node_inputs(relu, &[x]);
+        g.storage.set_node_outputs(relu, &[r_out]);
+        let sqrt = g.add_node(OpKind::Sqrt);
+        let out = g.add_value(ty, Some("out"), sqrt);
+        g.storage.set_node_inputs(sqrt, &[r_out]);
+        g.storage.set_node_outputs(sqrt, &[out]);
+        g.mark_output(out);
+
+        let specs = extract_kernels(&g);
+        assert_eq!(specs.len(), 2, "应有 2 个 KernelSpec (relu + sqrt)");
+        assert_eq!(specs[0].op, OpKind::Relu);
+        assert_eq!(specs[1].op, OpKind::Sqrt);
+        // 名字应按节点顺序编号
+        assert!(specs[0].name.ends_with("_0"), "第一个 kernel 名字应以 _0 结尾: {}", specs[0].name);
+        assert!(specs[1].name.ends_with("_1"), "第二个 kernel 名字应以 _1 结尾: {}", specs[1].name);
+    }
+
+    /// TensorSpec 应正确提取 shape 和 name
+    #[test]
+    fn extract_tensor_metadata() {
+        let mut g = Graph::new("meta");
+        let ty = Type::Tensor {
+            dtype: DType::F32,
+            dims: vec![16, 32],
+        };
+        let x = g.add_input(ty.clone(), Some("input_x"));
+        let add = g.add_node(OpKind::Add);
+        let out = g.add_value(ty, Some("output_y"), add);
+        g.storage.set_node_inputs(add, &[x, x]);
+        g.storage.set_node_outputs(add, &[out]);
+        g.mark_output(out);
+
+        let specs = extract_kernels(&g);
+        let spec = &specs[0];
+        // 输入应有 name="input_x"，shape=[16, 32]
+        let in0 = &spec.inputs[0];
+        assert_eq!(in0.name, "input_x");
+        assert_eq!(in0.dims, vec![16, 32]);
+        assert!(in0.is_input);
+        // 输出应有 name="output_y"
+        let out0 = &spec.outputs[0];
+        assert_eq!(out0.name, "output_y");
+        assert_eq!(out0.dims, vec![16, 32]);
+        assert!(!out0.is_input);
+    }
+
+    /// op_short_name 每个变体都要返回非空短名
+    #[test]
+    fn op_short_name_all_variants_nonempty() {
+        // 添加新 OpKind 变体时 op_short_name 漏写分支会编译失败
+        // (non-exhaustive match)，但仍要确保返回值非空
+        for op in [
+            OpKind::Add, OpKind::Sub, OpKind::Mul, OpKind::Div,
+            OpKind::MatMul, OpKind::Relu, OpKind::Gelu, OpKind::Sigmoid,
+            OpKind::Tanh, OpKind::Softmax, OpKind::LayerNorm, OpKind::Conv,
+            OpKind::Pool, OpKind::Reshape, OpKind::Transpose, OpKind::Concat,
+            OpKind::Slice, OpKind::Constant, OpKind::Placeholder, OpKind::Return,
+            OpKind::Sqrt, OpKind::Exp, OpKind::Pow,
+            OpKind::ReduceSum, OpKind::ReduceMean, OpKind::ReduceMax,
+            OpKind::Rsqrt, OpKind::Reciprocal, OpKind::Abs, OpKind::Log,
+            OpKind::Fused, OpKind::Custom,
+        ] {
+            let name = op_short_name(op);
+            assert!(!name.is_empty(), "OpKind::{:?} short name 为空", op);
+        }
+    }
+}
