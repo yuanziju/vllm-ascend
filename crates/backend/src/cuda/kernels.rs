@@ -1282,4 +1282,274 @@ mod tests {
         assert!(out.source.contains("__shared__"));
         assert!(out.source.contains("__syncthreads"));
     }
+
+    // ---- 元素级二元 op 表达式（之前只测了 Add）----
+    #[test]
+    fn test_elem_binary_sub_mul_div_pow() {
+        let cases = [
+            (OpKind::Sub, "c[i] = a[i] - b[i];"),
+            (OpKind::Mul, "c[i] = a[i] * b[i];"),
+            (OpKind::Div, "c[i] = a[i] / b[i];"),
+            (OpKind::Pow, "powf(a[i], b[i])"),
+        ];
+        for &(op, needle) in &cases {
+            let out = generate(&[make_spec("k", op)], GpuArch::Ampere80).unwrap();
+            assert!(out.source.contains(needle), "{:?} 应生成 `{}`", op, needle);
+        }
+    }
+
+    #[test]
+    fn test_elem_unary_relu_gelu_sigmoid_tanh() {
+        let cases = [
+            (OpKind::Relu, "fmaxf(a[i], 0.0f)"),
+            (OpKind::Gelu, "0.5f * a[i] * (1.0f + tanhf"),
+            (OpKind::Sigmoid, "1.0f / (1.0f + expf(-a[i]))"),
+            (OpKind::Tanh, "tanhf(a[i])"),
+        ];
+        for &(op, needle) in &cases {
+            let out = generate(&[make_spec("k", op)], GpuArch::Ampere80).unwrap();
+            assert!(out.source.contains(needle), "{:?} 应生成 `{}`", op, needle);
+        }
+    }
+
+    #[test]
+    fn test_elem_unary_sqrt_exp_log_rsqrt_reciprocal_abs() {
+        let cases = [
+            (OpKind::Sqrt, "sqrtf(a[i])"),
+            (OpKind::Exp, "expf(a[i])"),
+            (OpKind::Log, "logf(a[i])"),
+            (OpKind::Rsqrt, "rsqrtf(a[i])"),
+            (OpKind::Reciprocal, "1.0f / a[i]"),
+            (OpKind::Abs, "fabsf(a[i])"),
+        ];
+        for &(op, needle) in &cases {
+            let out = generate(&[make_spec("k", op)], GpuArch::Ampere80).unwrap();
+            assert!(out.source.contains(needle), "{:?} 应生成 `{}`", op, needle);
+        }
+    }
+
+    // ---- Conv（直接卷积，嵌套循环）----
+    #[test]
+    fn test_conv_kernel_defaults() {
+        let out = generate(&[make_spec("k", OpKind::Conv)], GpuArch::Ampere80).unwrap();
+        // 默认 stride=1, padding=0, dilation=1, groups=1
+        assert!(out.source.contains("stride=1"));
+        assert!(out.source.contains("padding=0"));
+        assert!(out.source.contains("dilation=1"));
+        assert!(out.source.contains("groups=1"));
+        // 直接卷积核心：acc += in_val * w_val
+        assert!(out.source.contains("acc += in_val * w_val;"));
+        assert!(out.source.contains("__global__"));
+        // 嵌套循环 KH/KW/C
+        assert!(out.source.contains("for (int kh = 0; kh < KH;"));
+    }
+
+    #[test]
+    fn test_conv_kernel_custom_attrs() {
+        let mut spec = make_spec("k", OpKind::Conv);
+        spec.attrs.conv_stride = vec![2];
+        spec.attrs.conv_padding = vec![3];
+        spec.attrs.conv_dilation = vec![2];
+        spec.attrs.conv_groups = Some(4);
+        let out = generate(&[spec], GpuArch::Ampere80).unwrap();
+        assert!(out.source.contains("stride=2"));
+        assert!(out.source.contains("padding=3"));
+        assert!(out.source.contains("dilation=2"));
+        assert!(out.source.contains("groups=4"));
+    }
+
+    // ---- Pool（max 池化）----
+    #[test]
+    fn test_pool_kernel_defaults() {
+        let out = generate(&[make_spec("k", OpKind::Pool)], GpuArch::Ampere80).unwrap();
+        // 默认 kernel_size=2, stride=1, padding=0
+        assert!(out.source.contains("kernel_size=2"));
+        assert!(out.source.contains("stride=1"));
+        assert!(out.source.contains("padding=0"));
+        // max pool 用 fmaxf + -INFINITY 初值
+        assert!(out.source.contains("fmaxf"));
+        assert!(out.source.contains("-INFINITY"));
+    }
+
+    #[test]
+    fn test_pool_kernel_custom_attrs() {
+        let mut spec = make_spec("k", OpKind::Pool);
+        spec.attrs.pool_kernel = vec![3];
+        spec.attrs.pool_stride = vec![2];
+        spec.attrs.pool_padding = vec![1];
+        let out = generate(&[spec], GpuArch::Ampere80).unwrap();
+        assert!(out.source.contains("kernel_size=3"));
+        assert!(out.source.contains("stride=2"));
+        assert!(out.source.contains("padding=1"));
+    }
+
+    // ---- Reshape（copy kernel）----
+    #[test]
+    fn test_reshape_kernel_is_copy() {
+        let out = generate(&[make_spec("k", OpKind::Reshape)], GpuArch::Ampere80).unwrap();
+        assert!(out.source.contains("output[i] = input[i];"));
+        assert!(out.source.contains("__global__"));
+    }
+
+    // ---- Concat（按 axis 拼接，两输入）----
+    #[test]
+    fn test_concat_kernel_axis() {
+        // 默认 axis=0
+        let out = generate(&[make_spec("k", OpKind::Concat)], GpuArch::Ampere80).unwrap();
+        assert!(out.source.contains("axis=0"));
+        assert!(out.source.contains("in_a"));
+        assert!(out.source.contains("in_b"));
+        assert!(out.source.contains("output[i] = in_a[i];"));
+        assert!(out.source.contains("output[i] = in_b[i - a_axis_len];"));
+
+        // 自定义 axis
+        let mut spec = make_spec("k2", OpKind::Concat);
+        spec.attrs.axis = Some(1);
+        let out = generate(&[spec], GpuArch::Ampere80).unwrap();
+        assert!(out.source.contains("axis=1"));
+    }
+
+    // ---- Slice（按 starts/ends/steps 拷贝）----
+    #[test]
+    fn test_slice_kernel_defaults() {
+        let out = generate(&[make_spec("k", OpKind::Slice)], GpuArch::Ampere80).unwrap();
+        // 空 starts/ends/steps 时用默认占位
+        assert!(out.source.contains("starts=[0]"));
+        assert!(out.source.contains("ends=[-1]"));
+        assert!(out.source.contains("steps=[1]"));
+        assert!(out.source.contains("src_idx = start + i * step;"));
+    }
+
+    #[test]
+    fn test_slice_kernel_custom_attrs() {
+        let mut spec = make_spec("k", OpKind::Slice);
+        spec.attrs.slice_starts = vec![2, 4];
+        spec.attrs.slice_ends = vec![10, 20];
+        spec.attrs.slice_steps = vec![2, 1];
+        let out = generate(&[spec], GpuArch::Ampere80).unwrap();
+        assert!(out.source.contains("starts=[2, 4]"));
+        assert!(out.source.contains("ends=[10, 20]"));
+        assert!(out.source.contains("steps=[2, 1]"));
+    }
+
+    // ---- Placeholder / Return（数据流标记，无 kernel）----
+    #[test]
+    fn test_placeholder_no_global() {
+        let out = generate(&[make_spec("k", OpKind::Placeholder)], GpuArch::Ampere80).unwrap();
+        assert!(
+            !out.source.contains("__global__"),
+            "Placeholder 不应生成 kernel"
+        );
+        assert!(out.source.contains("placeholder"));
+    }
+
+    #[test]
+    fn test_return_no_global() {
+        let out = generate(&[make_spec("k", OpKind::Return)], GpuArch::Ampere80).unwrap();
+        assert!(!out.source.contains("__global__"), "Return 不应生成 kernel");
+        assert!(out.source.contains("return"));
+    }
+
+    // ---- make_header（arch/SM/include/特性行）----
+    #[test]
+    fn test_header_contains_arch_info() {
+        let out = generate(&[make_spec("k", OpKind::Add)], GpuArch::Hopper90).unwrap();
+        assert!(out.source.contains("微架构:"));
+        assert!(out.source.contains("kernel 数量: 1"));
+        assert!(out.source.contains("#include <cuda_runtime.h>"));
+        assert!(out.source.contains("#include <mma.h>"));
+        assert!(out.source.contains("using namespace nvcuda;"));
+        // Hopper 特性行（has_tma && has_wgmma）
+        assert!(out.source.contains("wgmma.mma_async"));
+    }
+
+    #[test]
+    fn test_header_blackwell_features() {
+        let out = generate(&[make_spec("k", OpKind::Add)], GpuArch::Blackwell100).unwrap();
+        assert!(out.source.contains("Blackwell tensor memory accelerator"));
+        assert!(out.source.contains("FP4/FP6"));
+    }
+
+    // ---- launch section（Placeholder/Return 跳过，Constant 特殊）----
+    #[test]
+    fn test_launch_section_placeholder_return_skipped() {
+        let kernels = vec![
+            make_spec("p", OpKind::Placeholder),
+            make_spec("r", OpKind::Return),
+        ];
+        let out = generate(&kernels, GpuArch::Ampere80).unwrap();
+        assert!(out.source.contains("launch_p: no kernel launch needed"));
+        assert!(out.source.contains("launch_r: no kernel launch needed"));
+    }
+
+    #[test]
+    fn test_launch_section_constant_special() {
+        let mut spec = make_spec("c", OpKind::Constant);
+        spec.attrs.value = Some(2.71);
+        let out = generate(&[spec], GpuArch::Ampere80).unwrap();
+        // Constant launch 签名特殊：void launch_c(float* out, cudaStream_t stream)
+        assert!(out
+            .source
+            .contains("void launch_c(float* out, cudaStream_t stream)"));
+        assert!(out.source.contains("init_constant value=2.71"));
+    }
+
+    // ---- dtype 传播（c_type 替换 __T__）----
+    #[test]
+    fn test_dtype_propagation_f16_i64() {
+        let mut spec = make_spec("k", OpKind::Add);
+        spec.dtype = DType::F16;
+        let out = generate(&[spec], GpuArch::Ampere80).unwrap();
+        assert!(out.source.contains("__half"), "F16 应生成 __half 类型");
+
+        let mut spec = make_spec("k2", OpKind::Add);
+        spec.dtype = DType::I64;
+        let out = generate(&[spec], GpuArch::Ampere80).unwrap();
+        assert!(
+            out.source.contains("long long"),
+            "I64 应生成 long long 类型"
+        );
+    }
+
+    // ---- 多 kernel 顺序（生成 + launch section 均按序）----
+    #[test]
+    fn test_multiple_kernels_order() {
+        let kernels = vec![
+            make_spec("first", OpKind::Add),
+            make_spec("second", OpKind::Relu),
+            make_spec("third", OpKind::Sqrt),
+        ];
+        let out = generate(&kernels, GpuArch::Ampere80).unwrap();
+        let first_pos = out.source.find("__global__ void first").unwrap();
+        let second_pos = out.source.find("__global__ void second").unwrap();
+        let third_pos = out.source.find("__global__ void third").unwrap();
+        assert!(first_pos < second_pos);
+        assert!(second_pos < third_pos);
+        // launch section 也按序
+        let l1 = out.source.find("launch_first").unwrap();
+        let l2 = out.source.find("launch_second").unwrap();
+        let l3 = out.source.find("launch_third").unwrap();
+        assert!(l1 < l2 && l2 < l3);
+    }
+
+    // ---- ReduceMax 用 -INFINITY 初值 ----
+    #[test]
+    fn test_reduce_max_uses_neg_infinity() {
+        let out = generate(&[make_spec("k", OpKind::ReduceMax)], GpuArch::Ampere80).unwrap();
+        assert!(out.source.contains("ReduceMax"));
+        assert!(
+            out.source.contains("-INFINITY"),
+            "ReduceMax 初值应为 -INFINITY"
+        );
+    }
+
+    // ---- Constant 多元素 __constant__ 数组 ----
+    #[test]
+    fn test_constant_tensor_data_array() {
+        let mut spec = make_spec("k", OpKind::Constant);
+        spec.attrs.tensor_data = vec![1.0, 2.0, 4.0, 8.0];
+        let out = generate(&[spec], GpuArch::Ampere80).unwrap();
+        assert!(out.source.contains("多元素常量"));
+        assert!(out.source.contains("__constant__ float const_data[4]"));
+    }
 }
