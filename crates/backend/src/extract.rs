@@ -191,7 +191,11 @@ mod tests {
         assert_eq!(spec.inputs.len(), 2, "Add 应有 2 个输入");
         assert_eq!(spec.outputs.len(), 1, "Add 应有 1 个输出");
         assert_eq!(spec.dtype, DType::F32);
-        assert!(spec.name.starts_with("neutron_add_"), "name 应为 neutron_add_*, 实际: {}", spec.name);
+        assert!(
+            spec.name.starts_with("neutron_add_"),
+            "name 应为 neutron_add_*, 实际: {}",
+            spec.name
+        );
     }
 
     /// 空图应返回空 KernelSpec 列表，不 panic
@@ -226,8 +230,16 @@ mod tests {
         assert_eq!(specs[0].op, OpKind::Relu);
         assert_eq!(specs[1].op, OpKind::Sqrt);
         // 名字应按节点顺序编号
-        assert!(specs[0].name.ends_with("_0"), "第一个 kernel 名字应以 _0 结尾: {}", specs[0].name);
-        assert!(specs[1].name.ends_with("_1"), "第二个 kernel 名字应以 _1 结尾: {}", specs[1].name);
+        assert!(
+            specs[0].name.ends_with("_0"),
+            "第一个 kernel 名字应以 _0 结尾: {}",
+            specs[0].name
+        );
+        assert!(
+            specs[1].name.ends_with("_1"),
+            "第二个 kernel 名字应以 _1 结尾: {}",
+            specs[1].name
+        );
     }
 
     /// TensorSpec 应正确提取 shape 和 name
@@ -265,15 +277,38 @@ mod tests {
         // 添加新 OpKind 变体时 op_short_name 漏写分支会编译失败
         // (non-exhaustive match)，但仍要确保返回值非空
         for op in [
-            OpKind::Add, OpKind::Sub, OpKind::Mul, OpKind::Div,
-            OpKind::MatMul, OpKind::Relu, OpKind::Gelu, OpKind::Sigmoid,
-            OpKind::Tanh, OpKind::Softmax, OpKind::LayerNorm, OpKind::Conv,
-            OpKind::Pool, OpKind::Reshape, OpKind::Transpose, OpKind::Concat,
-            OpKind::Slice, OpKind::Constant, OpKind::Placeholder, OpKind::Return,
-            OpKind::Sqrt, OpKind::Exp, OpKind::Pow,
-            OpKind::ReduceSum, OpKind::ReduceMean, OpKind::ReduceMax,
-            OpKind::Rsqrt, OpKind::Reciprocal, OpKind::Abs, OpKind::Log,
-            OpKind::Fused, OpKind::Custom,
+            OpKind::Add,
+            OpKind::Sub,
+            OpKind::Mul,
+            OpKind::Div,
+            OpKind::MatMul,
+            OpKind::Relu,
+            OpKind::Gelu,
+            OpKind::Sigmoid,
+            OpKind::Tanh,
+            OpKind::Softmax,
+            OpKind::LayerNorm,
+            OpKind::Conv,
+            OpKind::Pool,
+            OpKind::Reshape,
+            OpKind::Transpose,
+            OpKind::Concat,
+            OpKind::Slice,
+            OpKind::Constant,
+            OpKind::Placeholder,
+            OpKind::Return,
+            OpKind::Sqrt,
+            OpKind::Exp,
+            OpKind::Pow,
+            OpKind::ReduceSum,
+            OpKind::ReduceMean,
+            OpKind::ReduceMax,
+            OpKind::Rsqrt,
+            OpKind::Reciprocal,
+            OpKind::Abs,
+            OpKind::Log,
+            OpKind::Fused,
+            OpKind::Custom,
         ] {
             let name = op_short_name(op);
             assert!(!name.is_empty(), "OpKind::{:?} short name 为空", op);
