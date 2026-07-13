@@ -144,4 +144,97 @@ mod tests {
         let items = v.as_list().unwrap();
         assert_eq!(items.len(), 3);
     }
+
+    /// nil / true / false 字面量
+    #[test]
+    fn parses_bool_literals() {
+        assert!(matches!(parse("nil").unwrap(), Val::Nil));
+        assert!(matches!(parse("true").unwrap(), Val::Bool(true)));
+        assert!(matches!(parse("false").unwrap(), Val::Bool(false)));
+    }
+
+    /// 字符串字面量 + 转义序列
+    #[test]
+    fn parses_string_with_escapes() {
+        let v = parse(r#""hello\nworld""#).unwrap();
+        match v {
+            Val::Str(s) => assert_eq!(s, "hello\nworld"),
+            other => panic!("期望 Str，得到 {:?}", other),
+        }
+
+        let v = parse(r#""tab\there""#).unwrap();
+        match v {
+            Val::Str(s) => assert_eq!(s, "tab\there"),
+            _ => panic!("期望 Str"),
+        }
+
+        // \" 转义
+        let v = parse(r#""quote \"inside\"""#).unwrap();
+        match v {
+            Val::Str(s) => assert_eq!(s, "quote \"inside\""),
+            _ => panic!("期望 Str"),
+        }
+    }
+
+    /// 嵌套 list
+    #[test]
+    fn parses_nested_lists() {
+        let v = parse("(+ 1 (+ 2 3) 4)").unwrap();
+        let outer = v.as_list().unwrap();
+        assert_eq!(outer.len(), 4);
+        let inner = outer[2].as_list().unwrap();
+        assert_eq!(inner.len(), 3);
+    }
+
+    /// 空列表
+    #[test]
+    fn parses_empty_list() {
+        let v = parse("()").unwrap();
+        let items = v.as_list().unwrap();
+        assert!(items.is_empty());
+    }
+
+    /// 行注释（; 到行尾）
+    #[test]
+    fn parses_with_comments() {
+        let v = parse("; 这是注释\n(+ 1 2) ; 行尾注释").unwrap();
+        let items = v.as_list().unwrap();
+        assert_eq!(items.len(), 3);
+    }
+
+    /// quote 简写：'x 等价于 (quote x)
+    #[test]
+    fn parses_quote_shorthand() {
+        let v = parse("'foo").unwrap();
+        match v {
+            Val::Str(s) => assert_eq!(s, "quote"),
+            _ => panic!("期望 Str(\"quote\")"),
+        }
+    }
+
+    /// 空输入应返回 Nil
+    #[test]
+    fn parses_empty_input_as_nil() {
+        let v = parse("").unwrap();
+        assert!(matches!(v, Val::Nil));
+
+        let v = parse("   ").unwrap();
+        assert!(matches!(v, Val::Nil));
+
+        let v = parse("; just a comment").unwrap();
+        assert!(matches!(v, Val::Nil));
+    }
+
+    /// 未闭合的括号应返回错误
+    #[test]
+    fn parse_unclosed_paren_errors() {
+        assert!(parse("(+ 1 2").is_err());
+        assert!(parse("((()").is_err());
+    }
+
+    /// 未闭合的字符串字面量应返回错误
+    #[test]
+    fn parse_unclosed_string_errors() {
+        assert!(parse(r#""unclosed"#).is_err());
+    }
 }

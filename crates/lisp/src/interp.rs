@@ -110,8 +110,10 @@ fn call_builtin(name: &str, args: &[Val]) -> Result<Val, String> {
                     _ => return Err(format!("+ 不支持类型: {}", a)),
                 }
             }
+            // 注意：is_float=true 时 acc_float 已含所有 Int 累加，不能再 + acc_int
+            // （早期 bug：重复加 Int 导致 (+ 1 2.5)=4.5 而非 3.5）
             if is_float {
-                Ok(Val::Float(acc_float + acc_int as f64))
+                Ok(Val::Float(acc_float))
             } else {
                 Ok(Val::Int(acc_int))
             }
@@ -169,6 +171,8 @@ fn call_builtin(name: &str, args: &[Val]) -> Result<Val, String> {
                     _ => return Err(format!("* 不支持类型: {}", a)),
                 }
             }
+            // 同 +：is_float=true 时 acc_float 已含所有 Int 累乘
+            // （早期 bug：返回 acc_float + acc_int as f64，类型错且语义错）
             if is_float {
                 Ok(Val::Float(acc_float))
             } else {
@@ -286,5 +290,167 @@ mod tests {
         let mut interp = Interp::new();
         let r = interp.eval(&v).unwrap();
         assert!(matches!(r, Val::Int(10)));
+    }
+
+    fn eval_str(src: &str) -> Val {
+        let v = parse(src).unwrap();
+        let mut interp = Interp::new();
+        interp.eval(&v).unwrap()
+    }
+
+    fn eval_err(src: &str) -> String {
+        let v = parse(src).unwrap();
+        let mut interp = Interp::new();
+        interp.eval(&v).unwrap_err()
+    }
+
+    #[test]
+    fn sub_and_mul_work() {
+        assert!(matches!(eval_str("(- 10 3 2)"), Val::Int(5)));
+        assert!(matches!(eval_str("(* 2 3 4)"), Val::Int(24)));
+        // 单参数 -
+        assert!(matches!(eval_str("(- 5)"), Val::Int(5)));
+        // 单参数 *
+        assert!(matches!(eval_str("(* 7)"), Val::Int(7)));
+    }
+
+    #[test]
+    fn mixed_int_float_promotes_to_float() {
+        // int + float → float
+        match eval_str("(+ 1 2.5)") {
+            Val::Float(f) => assert!((f - 3.5).abs() < 1e-12),
+            other => panic!("期望 Float，得到 {:?}", other),
+        }
+        match eval_str("(- 10.0 3)") {
+            Val::Float(f) => assert!((f - 7.0).abs() < 1e-12),
+            other => panic!("期望 Float，得到 {:?}", other),
+        }
+        match eval_str("(* 2.0 3)") {
+            Val::Float(f) => assert!((f - 6.0).abs() < 1e-12),
+            _ => panic!("期望 Float"),
+        }
+    }
+
+    #[test]
+    fn division_int_and_float() {
+        assert!(matches!(eval_str("(/ 10 2)"), Val::Int(5)));
+        match eval_str("(/ 10.0 3)") {
+            Val::Float(f) => assert!((f - 10.0 / 3.0).abs() < 1e-12),
+            _ => panic!("期望 Float"),
+        }
+        // 整除向零取整
+        assert!(matches!(eval_str("(/ -7 2)"), Val::Int(-3)));
+    }
+
+    #[test]
+    fn division_by_zero_errors() {
+        assert!(eval_err("(/ 5 0)").contains("除零"));
+        assert!(eval_err("(/ 5.0 0.0)").contains("除零"));
+    }
+
+    #[test]
+    fn short_circuit_and_or() {
+        // and 短路：第一个假就返回，不评估后续
+        assert!(matches!(eval_str("(and true true)"), Val::Bool(true)));
+        assert!(matches!(eval_str("(and true false)"), Val::Bool(false)));
+        assert!(matches!(
+            eval_str("(and false undefined-sym)"),
+            Val::Bool(false)
+        ));
+
+        // or 短路：第一个真就返回
+        assert!(matches!(eval_str("(or false 42)"), Val::Int(42)));
+        assert!(matches!(eval_str("(or false false)"), Val::Bool(false)));
+        // or 第一个真 → 不评估后续
+        assert!(matches!(eval_str("(or 42 undefined-sym)"), Val::Int(42)));
+    }
+
+    #[test]
+    fn do_block_returns_last() {
+        assert!(matches!(eval_str("(do 1 2 3)"), Val::Int(3)));
+        // 空 do 返回 nil
+        assert!(matches!(eval_str("(do)"), Val::Nil));
+    }
+
+    #[test]
+    fn quote_returns_unevaled() {
+        // (quote sym) 返回 sym 本身（不求值）
+        match eval_str("(quote sym)") {
+            Val::Sym(s) => assert_eq!(s, "sym"),
+            other => panic!("期望 Sym，得到 {:?}", other),
+        }
+        // (quote (1 2 3)) 返回 list
+        match eval_str("(quote (1 2 3))") {
+            Val::List(items) => assert_eq!(items.len(), 3),
+            _ => panic!("期望 List"),
+        }
+    }
+
+    #[test]
+    fn if_without_else_returns_nil_when_false() {
+        assert!(matches!(eval_str("(if false 42)"), Val::Nil));
+    }
+
+    #[test]
+    fn not_builtin() {
+        assert!(matches!(eval_str("(not false)"), Val::Bool(true)));
+        assert!(matches!(eval_str("(not nil)"), Val::Bool(true)));
+        assert!(matches!(eval_str("(not 42)"), Val::Bool(false)));
+    }
+
+    #[test]
+    fn equality_and_inequality() {
+        assert!(matches!(eval_str("(= 1 1)"), Val::Bool(true)));
+        assert!(matches!(eval_str("(= 1 2)"), Val::Bool(false)));
+        assert!(matches!(eval_str("(< 1 2)"), Val::Bool(true)));
+        assert!(matches!(eval_str("(< 2 1)"), Val::Bool(false)));
+        // 字符串相等
+        assert!(matches!(eval_str(r#"(str= "foo" "foo")"#), Val::Bool(true)));
+        assert!(matches!(
+            eval_str(r#"(str= "foo" "bar")"#),
+            Val::Bool(false)
+        ));
+    }
+
+    #[test]
+    fn str_concatenation() {
+        match eval_str(r#"(str "hello" " " "world")"#) {
+            Val::Str(s) => assert_eq!(s, "hello world"),
+            _ => panic!("期望 Str"),
+        }
+    }
+
+    #[test]
+    fn unbound_symbol_errors() {
+        let err = eval_err("undefined_sym");
+        assert!(err.contains("未绑定符号"));
+    }
+
+    #[test]
+    fn unknown_function_errors() {
+        let err = eval_err("(unknown_fn 1 2)");
+        assert!(err.contains("未知函数"));
+    }
+
+    #[test]
+    fn wrong_arity_errors() {
+        // / 需要恰好 2 个参数
+        assert!(eval_err("(/ 1 2 3)").contains("2 个参数"));
+        // < 需要恰好 2 个参数
+        assert!(eval_err("(< 1 2 3)").contains("2 个参数"));
+        // not 需要恰好 1 个参数
+        assert!(eval_err("(not true false)").contains("1 个参数"));
+    }
+
+    #[test]
+    fn nil_evaluates_to_nil() {
+        assert!(matches!(eval_str("nil"), Val::Nil));
+        assert!(matches!(eval_str("true"), Val::Bool(true)));
+        assert!(matches!(eval_str("false"), Val::Bool(false)));
+    }
+
+    #[test]
+    fn empty_list_evaluates_to_empty_list() {
+        assert!(matches!(eval_str("()"), Val::List(_)));
     }
 }
