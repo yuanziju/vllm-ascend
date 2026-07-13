@@ -500,3 +500,119 @@ impl DTypeExt for DType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SourceLang::extension() 每个变体都要返回非空扩展名，
+    /// 添加新变体时若漏写分支会触发编译失败（non-exhaustive match），
+    /// 但仍要确保返回值不为空字符串。
+    #[test]
+    fn source_lang_extension_all_variants_nonempty() {
+        for lang in [
+            SourceLang::Cuda,
+            SourceLang::Triton,
+            SourceLang::Metal,
+            SourceLang::Cann,
+            SourceLang::Cpu,
+        ] {
+            let ext = lang.extension();
+            assert!(!ext.is_empty(), "SourceLang::{:?} extension 为空", lang);
+        }
+    }
+
+    /// SourceLang::name() 每个变体都要返回非空名字
+    #[test]
+    fn source_lang_name_all_variants_nonempty() {
+        for lang in [
+            SourceLang::Cuda,
+            SourceLang::Triton,
+            SourceLang::Metal,
+            SourceLang::Cann,
+            SourceLang::Cpu,
+        ] {
+            let name = lang.name();
+            assert!(!name.is_empty(), "SourceLang::{:?} name 为空", lang);
+        }
+    }
+
+    /// CPU target 明确标记为 not implemented，防止与 CUDA 混淆
+    #[test]
+    fn cpu_source_lang_marked_not_implemented() {
+        let name = SourceLang::Cpu.name();
+        assert!(
+            name.contains("not implemented"),
+            "CPU SourceLang name 应含 'not implemented' 提示，实际: {name}"
+        );
+        assert!(!name.contains("CUDA"), "CPU SourceLang name 不应含 CUDA");
+    }
+
+    /// 扩展名与代码生成约定一致
+    #[test]
+    fn source_lang_extension_matches_convention() {
+        assert_eq!(SourceLang::Cuda.extension(), "cu");
+        assert_eq!(SourceLang::Triton.extension(), "py");
+        assert_eq!(SourceLang::Metal.extension(), "metal");
+        assert_eq!(SourceLang::Cann.extension(), "cpp");
+        assert_eq!(SourceLang::Cpu.extension(), "c");
+    }
+
+    /// GpuArch::name() 每个变体都要返回非空名字
+    #[test]
+    fn gpu_arch_name_all_variants_nonempty() {
+        for arch in [
+            GpuArch::Ampere80,
+            GpuArch::Hopper90,
+            GpuArch::Blackwell100,
+            GpuArch::Apple6,
+            GpuArch::Apple7,
+            GpuArch::Apple8,
+            GpuArch::Ascend910B1,
+            GpuArch::Ascend910B3,
+            GpuArch::Ascend310P3,
+        ] {
+            let name = arch.name();
+            assert!(!name.is_empty(), "GpuArch::{:?} name 为空", arch);
+        }
+    }
+
+    /// GpuArch 能力查询：Hopper/Blackwell 支持 TMA 和 wgmma，Ampere 不支持
+    #[test]
+    fn gpu_arch_capability_flags() {
+        assert!(GpuArch::Hopper90.has_tma());
+        assert!(GpuArch::Hopper90.has_wgmma());
+        assert!(GpuArch::Blackwell100.has_tma());
+        assert!(GpuArch::Blackwell100.has_wgmma());
+        assert!(!GpuArch::Ampere80.has_tma());
+        assert!(!GpuArch::Ampere80.has_wgmma());
+
+        // Apple simdgroup
+        assert!(GpuArch::Apple6.has_simdgroup());
+        assert!(!GpuArch::Ampere80.has_simdgroup());
+
+        // Ascend Cube Core
+        assert!(GpuArch::Ascend910B1.has_cube_core());
+        assert!(GpuArch::Ascend910B3.has_cube_core());
+        assert!(!GpuArch::Ascend310P3.has_cube_core());
+    }
+
+    /// DTypeExt trait 各映射完整
+    #[test]
+    fn dtype_ext_all_variants_mapped() {
+        for dt in [
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::I64,
+            DType::I32,
+            DType::Bool,
+        ] {
+            assert!(!dt.c_type().is_empty());
+            assert!(!dt.msl_type().is_empty());
+            assert!(!dt.triton_type().is_empty());
+            assert!(!dt.cann_type().is_empty());
+            assert!(dt.size_bytes() > 0);
+        }
+    }
+}
