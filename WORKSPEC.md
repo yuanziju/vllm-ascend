@@ -102,7 +102,7 @@ TZ='Asia/Shanghai' date -d '+30 minutes' '+预计结束: %Y-%m-%d %H:%M:%S %Z'
 - **Imports**：`use` 按 std → external → crate 分组
 - **错误**：统一 `thiserror`，`base::NeutronError` + `base::Result<T>`
 - **unsafe**：集中在 `base/src/storage.rs`，上层只暴露 Safe API
-- **License**：Apache-2.0；语言 Rust（edition 2021，MSRV 1.75）；9-crate workspace（无 `neutron-` 前缀）
+- **License**：Apache-2.0；语言 Rust（edition 2021，MSRV 1.75）；11-crate workspace（无 `neutron-` 前缀）
 
 ## 9. 设计哲学红线（不可擅自变更）
 - **不要模式匹配**：不硬编码 `MatMul+Add→Linear` 这类贪心模式
