@@ -72,6 +72,10 @@ pub fn allocate(instructions: &[MachineInstr], reg_file: &RegisterFile) -> Alloc
             args: instr.args.clone(),
         };
 
+        // 同指令内已 load 过的 VReg → 复用同一临时寄存器（避免重复 load_spill）
+        // 例如 `fadd v0 v0`（v0 被溢出）只应插一条 load_spill，两个 operand 都用 R0
+        let mut loaded_in_this_instr: HashMap<VReg, PReg> = HashMap::new();
+
         // 处理 operands（use）：溢出的 VReg 前插 load
         for &operand in &instr.operands {
             if let Operand::VReg(vreg) = operand {
@@ -79,15 +83,22 @@ pub fn allocate(instructions: &[MachineInstr], reg_file: &RegisterFile) -> Alloc
                 let effective_vreg = coalesce_map.get(&vreg).copied().unwrap_or(vreg);
 
                 if coloring.spilled.contains(&effective_vreg) {
-                    let slot = spill_map[&effective_vreg];
-                    // 插入 load 指令：从栈槽加载到临时寄存器
-                    result_instrs.push(MachineInstr {
-                        op: "load_spill".into(),
-                        operands: vec![],
-                        defs: vec![Operand::PReg(PReg(0))], // 用 R0 作临时寄存器
-                        args: vec![format!("spill{}", slot)],
-                    });
-                    new_instr.operands.push(Operand::PReg(PReg(0)));
+                    if let Some(&preg) = loaded_in_this_instr.get(&effective_vreg) {
+                        // 同指令内已 load 过此 VReg，直接复用临时寄存器
+                        new_instr.operands.push(Operand::PReg(preg));
+                    } else {
+                        let slot = spill_map[&effective_vreg];
+                        let preg = PReg(0); // 用 R0 作临时寄存器
+                                            // 插入 load 指令：从栈槽加载到临时寄存器
+                        result_instrs.push(MachineInstr {
+                            op: "load_spill".into(),
+                            operands: vec![],
+                            defs: vec![Operand::PReg(preg)],
+                            args: vec![format!("spill{}", slot)],
+                        });
+                        new_instr.operands.push(Operand::PReg(preg));
+                        loaded_in_this_instr.insert(effective_vreg, preg);
+                    }
                 } else if let Some(&preg) = coloring.assignment.get(&effective_vreg) {
                     new_instr.operands.push(Operand::PReg(preg));
                 } else {
@@ -291,5 +302,82 @@ mod tests {
         for i in 0..10u32 {
             assert_eq!(result.vreg_to_preg[&VReg(i)], PReg(0));
         }
+    }
+
+    /// 同一条指令中两次 use 同一个被溢出的 VReg（如 `fadd v0 v0`）时，
+    /// 只应插入一条 load_spill，且两个 operand 都引用同一个临时寄存器。
+    /// 当前实现每条 use 独立插 load，会产生冗余 load_spill —— 此测试期望优化后的行为。
+    #[test]
+    fn allocate_same_instr_reuses_spill_load() {
+        // 构造：v0 区间最长（cost 最低 → 优先溢出），且 v0 在 use 指令里被用两次
+        //   load v0          # v0 def @ 0   区间 [0,7]
+        //   nop              # @ 1
+        //   nop              # @ 2
+        //   nop              # @ 3
+        //   load v1          # v1 def @ 4   区间 [4,7]
+        //   load v2          # v2 def @ 5   区间 [5,7]
+        //   load v3          # v3 def @ 6   区间 [6,7]
+        //   use v0 v0 v1 v2 v3   # @ 7  v0 被用两次
+        //   （v0/v1/v2/v3 都在 @7 活跃 → 4-clique 互干扰）
+        // K=2 时 4 个互干扰 VReg 至少要溢出 2 个；
+        // spill_cost：v0=3/8≈0.38 最低 → v0 必被溢出
+        let instrs = vec![
+            mk_instr("load", vec![], vec![0]),
+            mk_instr("nop", vec![], vec![]),
+            mk_instr("nop", vec![], vec![]),
+            mk_instr("nop", vec![], vec![]),
+            mk_instr("load", vec![], vec![1]),
+            mk_instr("load", vec![], vec![2]),
+            mk_instr("load", vec![], vec![3]),
+            mk_instr("use", vec![0, 0, 1, 2, 3], vec![]), // v0 被用两次
+        ];
+
+        // 只用 2 个寄存器 → 强制溢出
+        let rf = RegisterFile {
+            num_registers: 2,
+            reserved: vec![],
+        };
+        let result = allocate(&instrs, &rf);
+
+        // v0 应被溢出（cost 最低）
+        assert!(
+            result.spilled.contains(&VReg(0)),
+            "v0 应被溢出（cost 最低），实际 spilled = {:?}",
+            result.spilled
+        );
+
+        // 找到 use 指令（结果中应只有一条 op=use）
+        let use_instrs: Vec<_> = result
+            .instructions
+            .iter()
+            .filter(|i| i.op == "use")
+            .collect();
+        assert_eq!(use_instrs.len(), 1, "应只有一条 use 指令");
+
+        // 在 use 之前紧邻的 load_spill 应只有两条：
+        //   1 条 for v0（v0 在 use 中被用两次，应共享同一条 load_spill）
+        //   1 条 for v1（也被溢出）
+        // 当前未优化的实现会产生 3 条（v0 重复 use 各插一条 load_spill）
+        let use_pos = result
+            .instructions
+            .iter()
+            .position(|i| i.op == "use")
+            .expect("应找到 use");
+        let load_spill_before_use: Vec<_> = result.instructions[..use_pos]
+            .iter()
+            .rev()
+            .take_while(|i| i.op == "load_spill")
+            .collect();
+        assert_eq!(
+            load_spill_before_use.len(),
+            2,
+            "use 前应只有 2 条 load_spill（v0 共享 1 条 + v1 1 条），实际有 {} 条\n完整序列: {:?}",
+            load_spill_before_use.len(),
+            result
+                .instructions
+                .iter()
+                .map(|i| i.op.clone())
+                .collect::<Vec<_>>()
+        );
     }
 }
