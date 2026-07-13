@@ -596,12 +596,35 @@ cargo run -p cli -- /tmp/empty.onnx --target cuda --opt 2 --dump
 
 **下一步**（优先级排序）：
 1. regalloc 增强：live-out 精确干扰（当前区间近似，move 例外是补丁；标准做法是每条指令算 live-out 集合，move src/dst 不互相干扰）
-2. regalloc 增强：spill code 位置优化（当前 def 后立即 store，可延迟到首次溢出 use 前）
+2. regalloc 增强：spill code 位置优化（当前 def 后立即 store，可延迟到首次溢出 use 前）— **同指令内重复 use 已优化**（见 2026-07-13 日志），跨指令共享 load 待做
 3. regalloc 增强：rematerialization（常量/地址计算类 VReg 溢出时不 store/load 而是原地重算）
 4. pt 前端：PyTorch 解析（TorchScript pickle 太复杂，维持占位；可走 ONNX export 路线）
 5. isel：规则按 target 分规则集（CUDA/NPU/CPU 不同指令）
 6. Slice no-op 识别：需先补 AttrKey::Starts/Ends/Axes/Steps + frontend 解析 Slice 属性
 7. frontend：解析 ONNX 子图（if/loop）+ 更多属性类型
+
+### 2026-07-13 — 测试覆盖加固 + lisp 算术 bug 修复（feat/neutron-backend）
+
+**当前状态**：本轮继续在 feat/neutron-backend 分支推进代码质量改进。5 个 commit 已 push（c279860 / 325b027 / d506e92 / ae36729 / f6787fc），全 workspace 测试 261 → **311 passed**，clippy + fmt 干净。无接口变化，无破坏性改动。
+
+**已完成**：
+- **arch crate 测试空白填补**（commit c279860）— arch crate 之前完全无测试，加 6 个：lower() Add/relu/sqrt/tanh/32 个 OpKind 全覆盖 + ArchGraph 基础 API + CudaDesc 默认值
+- **regalloc spill 重写优化**（commit 325b027）— 修一个 spill 重写小 bug：`fadd v0 v0`（v0 被溢出）原本插两条 load_spill，改为同指令内同 VReg 共享一次 load（loaded_in_this_instr HashMap）。新增测试 allocate_same_instr_reuses_spill_load 验证
+- **base/storage.rs 测试空白填补**（commit d506e92）— storage.rs 含 unsafe 强转 i64/f64 slice，是关键风险点但 0 测试。加 17 个测试：AttrKey/AttrTag 全变体 u8 往返 + alloc_node/value 递增 ID + 5 种属性类型往返 + 多节点共享 edges 池隔离 + value_shape/name 往返 + set_value_shape 覆盖 + parent_region 默认值 + add_name null 终止
+- **lisp +/* 混合 int/float bug 修复**（commit ae36729）— TDD 流程揭露 bug：`(+ 1 2.5)` 返回 4.5 而非 3.5，`(* 2.0 3)` 返回 9.0 而非 6.0。根因：is_float=true 分支返回 `acc_float + acc_int as f64`，但 acc_float 在循环里已累加了每个 Int（`acc_float += *i as f64`），导致 Int 被算两遍。修复：is_float=true 时直接返回 acc_float。对照 `-` 实现就是这种写法。同时加 25 个测试覆盖 parser 转义/嵌套/注释/错误 + interp 算术/短路逻辑/字符串/错误处理
+- **backend emit() 路由测试**（commit f6787fc）— backend/lib.rs 之前 0 测试，emit() 是入口调度但路由分支没专测。加 7 个测试覆盖 Target/SourceLang 全路由 + CPU 占位 + 空图不 panic + arch 透传
+
+**协作状态**（Shannon-Model Issue #1）：
+- 评论 4953644034 已发送，同步 vllm-ascend 3 个 commit 进度（实际是 5 个，评论时是 3 个）
+- 对方 trae/agent-nP28Lt 分支（0374674）有 test.yml / build.yml / release.yml 三个修复，未合 main，无 open PR
+- 对方未回复，按"不干涉对方工作"原则不催
+
+**下一步**（优先级排序）：
+1. regalloc：live-out 精确干扰（最大风险改进，需重构 build/analyze，会改变现有干扰图边数）
+2. regalloc：rematerialization（常量 VReg 溢出时原地重算而非 store/load）
+3. backend：cuda/kernels.rs 1285 行只 13 个测试，比例偏低，可补
+4. frontend：onnx.rs 1201 行只 14 个测试，比例偏低
+5. isel：规则按 target 分规则集
 
 ### 2026-07-11 — 后端代码生成四件套（feat/neutron-backend）
 
